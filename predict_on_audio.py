@@ -14,9 +14,15 @@ import utils
 import utils_train
 
 import numpy as np
+import tensorflow as tf
 
 import os
 import argparse
+
+tf.config.threading.set_intra_op_parallelism_threads(0)
+tf.config.threading.set_inter_op_parallelism_threads(0)
+
+CHUNK_LEN = 2000
 
 
 def get_single_test_prediction_phase_free(model, audio_file=None):
@@ -26,7 +32,7 @@ def get_single_test_prediction_phase_free(model, audio_file=None):
     if audio_file is not None:
         # should not be the case
         pump = utils.create_pump_object()
-        features = utils.compute_pump_features(pump, audio_file)
+        features = utils.compute_pump_features_segmented(pump, audio_file)
         input_hcqt = features['dphase/mag'][0]
 
 
@@ -35,12 +41,12 @@ def get_single_test_prediction_phase_free(model, audio_file=None):
 
     input_hcqt = input_hcqt.transpose(1, 2, 0)[np.newaxis, :, :, :]
 
-    n_t = input_hcqt.shape[2]
-    t_slices = list(np.arange(0, n_t, 5000))
+    n_t = input_hcqt.shape[3]
+    t_slices = list(np.arange(0, n_t, CHUNK_LEN))
     output_list = []
     # we need two inputs
     for t in t_slices:
-        p = model.predict(np.transpose(input_hcqt[:, :, t:t+5000, :], (0, 1, 3, 2)))[0, :, :]
+        p = model.predict(np.transpose(input_hcqt[:, :, :, t:t+CHUNK_LEN], (0, 1, 3, 2)))[0, :, :]
 
         output_list.append(p)
 
@@ -55,7 +61,7 @@ def get_single_test_prediction(model, audio_file=None):
     if audio_file is not None:
 
         pump = utils.create_pump_object()
-        features = utils.compute_pump_features(pump, audio_file)
+        features = utils.compute_pump_features_segmented(pump, audio_file)
         input_hcqt = features['dphase/mag'][0]
         input_dphase = features['dphase/dphase'][0]
 
@@ -65,13 +71,13 @@ def get_single_test_prediction(model, audio_file=None):
     input_hcqt = input_hcqt.transpose(1, 2, 0)[np.newaxis, :, :, :]
     input_dphase = input_dphase.transpose(1, 2, 0)[np.newaxis, :, :, :]
 
-    n_t = input_hcqt.shape[2]
-    t_slices = list(np.arange(0, n_t, 5000))
+    n_t = input_hcqt.shape[3]
+    t_slices = list(np.arange(0, n_t, CHUNK_LEN))
     output_list = []
 
     for t in t_slices:
-        p = model.predict([np.transpose(input_hcqt[:, :, t:t+5000, :], (0, 1, 3, 2)),
-                           np.transpose(input_dphase[:, :, t:t+5000, :], (0, 1, 3, 2))]
+        p = model.predict([np.transpose(input_hcqt[:, :, :, t:t+CHUNK_LEN], (0, 1, 3, 2)),
+                           np.transpose(input_dphase[:, :, :, t:t+CHUNK_LEN], (0, 1, 3, 2))]
                           )[0, :, :]
 
         output_list.append(p)
@@ -90,7 +96,7 @@ def main(args):
     if model_name == 'model1':
 
         save_key = 'exp1multif0'
-        model_path = "./models/{}.pkl".format(save_key)
+        model_path = "./models/{}.h5".format(save_key)
         model = models.build_model1()
         model.load_weights(model_path)
         thresh = 0.4
@@ -98,7 +104,7 @@ def main(args):
     elif model_name == 'model2':
 
         save_key = 'exp2multif0'
-        model_path = "./models/{}.pkl".format(save_key)
+        model_path = "./models/{}.h5".format(save_key)
         model = models.build_model2()
         model.load_weights(model_path)
         thresh = 0.5
@@ -106,7 +112,7 @@ def main(args):
     elif model_name == 'model3':
 
         save_key = 'exp3multif0'
-        model_path = "./models/{}.pkl".format(save_key)
+        model_path = "./models/{}.h5".format(save_key)
         model = models.build_model3()
         model.load_weights(model_path)
         thresh = 0.5
@@ -114,7 +120,7 @@ def main(args):
     elif model_name == 'model4':
 
         save_key = 'exp4multif0'
-        model_path = "./models/{}.pkl".format(save_key)
+        model_path = "./models/{}.h5".format(save_key)
         model = models.build_model3()
         model.load_weights(model_path)
         thresh = 0.4
@@ -122,7 +128,7 @@ def main(args):
     elif model_name == 'model7':
 
         save_key = 'exp7multif0'
-        model_path = "./models/{}.pkl".format(save_key)
+        model_path = "./models/{}.h5".format(save_key)
         model = models.build_model3_mag()
         model.load_weights(model_path)
         thresh = 0.4
