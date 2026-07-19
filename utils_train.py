@@ -6,6 +6,7 @@ import ast
 
 import numpy as np
 import matplotlib.pyplot as plt
+import librosa.display
 import pandas as pd
 import scipy
 
@@ -424,6 +425,33 @@ def get_single_test_prediction(model, npy_file=None, audio_file=None):
 
     predicted_output = np.hstack(output_list)
     return predicted_output, input_hcqt, input_dphase
+
+def plot_salience(pitch_activation_mat, save_path=None):
+    """Plot the pitch salience map (time x frequency) predicted by the model,
+    before it is thresholded/peak-picked into discrete F0 values.
+    """
+    (bins_per_octave, _, _, sr, fmin, hop_length, _) = utils.get_hcqt_params()
+
+    plt.figure(figsize=(15, 7))
+    librosa.display.specshow(
+        pitch_activation_mat,
+        x_axis='time',
+        y_axis='cqt_hz',
+        sr=sr,
+        hop_length=hop_length,
+        fmin=fmin,
+        bins_per_octave=bins_per_octave,
+        cmap='inferno'
+    )
+    plt.title('Pitch salience')
+    plt.colorbar(label='Activation')
+
+    if save_path is not None:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+
 
 def pitch_activations_to_mf0(pitch_activation_mat, thresh):
     """Convert a pitch activation map to multif0 by thresholding peak values

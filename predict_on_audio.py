@@ -91,6 +91,7 @@ def main(args):
     model_name = args.model_name
     audiofile = args.audiofile
     audio_folder = args.audio_folder
+    plot_salience = args.plot_salience
 
     # load model weights
     if model_name == 'model1':
@@ -161,6 +162,11 @@ def main(args):
 
         predicted_output = predicted_output.astype(np.float32)
 
+        if plot_salience:
+            utils_train.plot_salience(
+                predicted_output, save_path=audiofile.replace('.wav', '_salience.png')
+            )
+
         est_times, est_freqs = utils_train.pitch_activations_to_mf0(predicted_output, thresh)
 
         # rearrange output
@@ -197,6 +203,14 @@ def main(args):
                 )
 
             predicted_output = predicted_output.astype(np.float32)
+
+            if plot_salience:
+                utils_train.plot_salience(
+                    predicted_output,
+                    save_path=os.path.join(
+                        audio_folder, audiofile.replace('.wav', '_salience.png')
+                    )
+                )
 
             est_times, est_freqs = utils_train.pitch_activations_to_mf0(predicted_output, thresh)
 
@@ -242,5 +256,11 @@ if __name__ == "__main__":
                         default="0",
                         type=str,
                         help="Directory with audio files to analyze. If using the audiofile mode, this should be skipped.")
+
+    parser.add_argument("--plot_salience",
+                        dest='plot_salience',
+                        action='store_true',
+                        help="If set, save a pitch salience (time-frequency) plot as a PNG "
+                             "next to each output CSV, before it is converted into F0 estimates.")
 
     main(parser.parse_args())
