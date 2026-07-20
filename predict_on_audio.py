@@ -137,6 +137,10 @@ def main(args):
     else:
         raise ValueError("Specified model must be model1, model2 or model3.")
 
+    # allow overriding the model's default global threshold from the CLI
+    if args.thresh is not None:
+        thresh = args.thresh
+
     # compile model
 
     model.compile(
@@ -162,12 +166,14 @@ def main(args):
 
         predicted_output = predicted_output.astype(np.float32)
 
+        est_times, est_freqs = utils_train.pitch_activations_to_mf0(predicted_output, thresh)
+
         if plot_salience:
             utils_train.plot_salience(
-                predicted_output, save_path=audiofile.replace('.wav', '_salience.png')
+                predicted_output, audiofile.replace('.wav', '_salience.png'),
+                est_times, est_freqs
             )
 
-        est_times, est_freqs = utils_train.pitch_activations_to_mf0(predicted_output, thresh)
 
         # rearrange output
         for i, (tms, fqs) in enumerate(zip(est_times, est_freqs)):
@@ -204,15 +210,16 @@ def main(args):
 
             predicted_output = predicted_output.astype(np.float32)
 
+            est_times, est_freqs = utils_train.pitch_activations_to_mf0(predicted_output, thresh)
+
             if plot_salience:
                 utils_train.plot_salience(
                     predicted_output,
                     save_path=os.path.join(
-                        audio_folder, audiofile.replace('.wav', '_salience.png')
+                        audio_folder, audiofile.replace('.wav', '_salience.png'),
+                    est_times, est_freqs
                     )
                 )
-
-            est_times, est_freqs = utils_train.pitch_activations_to_mf0(predicted_output, thresh)
 
             # rearrange output
             for i, (tms, fqs) in enumerate(zip(est_times, est_freqs)):
@@ -262,5 +269,12 @@ if __name__ == "__main__":
                         action='store_true',
                         help="If set, save a pitch salience (time-frequency) plot as a PNG "
                              "next to each output CSV, before it is converted into F0 estimates.")
+
+    parser.add_argument("--thresh",
+                        dest='thresh',
+                        default=None,
+                        type=float,
+                        help="Override the global salience threshold for peak selection. "
+                             "If omitted, the model's default is used. Ignored when --adaptive_thresh is set.")
 
     main(parser.parse_args())
