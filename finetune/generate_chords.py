@@ -327,8 +327,8 @@ def notes_to_midi(path, notes):
         tr = MidiTrack()
         tr.name(v['name'])
         ch = vi                       # channels 0..5 (none is the percussion ch 9)
-        tr.control(0, ch, 0, 0)       # bank select MSB = 0
-        tr.control(0, ch, 32, 1)      # bank select LSB = 1
+        tr.control(0, ch, 0, 1)       # bank select MSB = 1 
+        tr.control(0, ch, 32, 0)      # bank select LSB = 0
         seq = sorted([note for note in notes if note.voice_idx == vi], key=lambda x: x.onset)
         last_program = None
         for note in seq:
