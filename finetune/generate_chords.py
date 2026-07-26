@@ -42,10 +42,11 @@ Two splits:
                regress) used to select the fine-tuning epoch.
 
 IMPORTANT -- CC7 -> dB mapping. The dB levels below assume the PWA interprets
-CC7 as a LINEAR amplitude gain (gain = cc/127), giving dB = 20*log10(cc/127).
-If your PWA uses a different volume curve, adjust ``cc7_from_db`` so the intended
-relative dB between voices is what actually gets rendered. Only the *relative*
-levels matter (the model is globally gain-invariant).
+CC7 as a LINEAR amplitude gain (gain = cc/100), with the default CC7=100 taken
+as 0 dB, giving dB = 20*log10(cc/100). If your PWA uses a different volume
+curve, adjust ``cc7_from_db`` so the intended relative dB between voices is
+what actually gets rendered. Only the *relative* levels matter (the model is
+globally gain-invariant).
 
 The soundfont (Choir_practice.sf2) bank/program + ranges are baked in below.
 """
@@ -125,9 +126,10 @@ VICTIM_DB_CHOICES = [-6.0, -12.0, -12.0, -18.0, -18.0]
 
 def cc7_from_db(db):
     """Map a target dB (<=0) to a CC7 value, assuming the PWA treats CC7 as a
-    linear amplitude gain (gain = cc/127). Adjust if your PWA differs."""
+    linear amplitude gain (gain = cc/100), with 0 dB at the default CC7=100.
+    Adjust if your PWA differs."""
     amp = 10.0 ** (db / 20.0)
-    return max(1, min(127, int(round(127 * amp))))
+    return max(1, min(127, int(round(100 * amp))))
 
 
 def midi_to_freq(m):
