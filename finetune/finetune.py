@@ -4,9 +4,23 @@ synthetic SSATBB chords produced by generate_chords.py (rendered to wav by the
 PWA).
 
 Method (see ../research/finetune_conversation.md):
-  * Freeze both base_model feature-extractor branches (BatchNorm included -> they
-    run in inference mode, keeping the original input normalisation). Train only
-    the decision head: conv7, conv8, distribution, squishy.
+  * A soft/quiet voice is an input-amplitude/SNR domain shift whose evidence is
+    attenuated at the input BatchNorm and the early/mid harmonic layers
+    (conv1..harm2) -- i.e. BEFORE the decision head. Head-only fine-tuning cannot
+    recover information the front end already discarded, so it is deliberately
+    NOT offered. --strategy adapts where the loss actually happens:
+      - bn   : AdaBN recalibration -- freeze all conv/dense weights, adapt only
+               BatchNorm (gamma/beta + running stats recalibrate to the new
+               amplitude distribution). Cheapest; try first. Note BN pools its
+               statistics over the whole window, so a narrow quiet-voice sub-band
+               is diluted -- bn alone may be insufficient (hence full below).
+      - full : fine-tune all layers so the early harmonic detectors themselves
+               learn to keep a quiet voice above threshold. Pair with --l2sp to
+               anchor weights to their pretrained values (L2-SP, Xuhong et al.
+               2018) so normal-balance performance is not erased.
+  * --pos_weight upweights the loss on annotated (voice) time-frequency bins --
+    "reweight near the soft voice's F0" -- countering the sparse-positive target
+    so quiet-voice bins are not drowned by the empty background.
   * Each rendered file is featurised once (whole-file CQT, so no edge artifacts),
     sliced into chord segments using the annotation's silent gaps, and each chord
     is cut into fixed WINDOWS (~50 frames). Windows are cached to disk and
@@ -15,14 +29,16 @@ Method (see ../research/finetune_conversation.md):
     `distribution` layer's (360,1) kernel makes its backprop-filter memory scale
     with T (a whole chord OOMs; ~50 frames keeps it ~1.6 GB). Windowing within
     chords also skips the inter-chord silence.
-  * Select the epoch by the INVARIANCE GAP on the matched validation pair
-    (balanced vs. one-voice-quiet): quiet-voice recall must rise while the
-    balanced case does not regress. bkld loss, small LR, few epochs.
+  * Epoch selection VALIDATES BOTH SIDES on the matched pair (balanced vs.
+    one-voice-quiet): keep the epoch with the highest quiet-voice recall among
+    those whose balanced recall/precision do not regress past --bal_tol vs. the
+    pre-training baseline. Small LR, few epochs.
 
 Layout expected (from generate_chords.py + PWA render):
     <train_dir>/train_XXXX.wav      + train_XXXX.f0.csv
-    <valid_dir>/valid_XXXX_balanced.wav      + .f0.csv
-    <valid_dir>/valid_XXXX_victim_<V>.wav    + .f0.csv   (same notes, V quiet)
+    <valid_dir>/valid_XXXX_balanced.wav    + .f0.csv
+    <valid_dir>/valid_XXXX_victim.wav      + .f0.csv   (same notes, one quiet
+                                                        voice per chord)
 """
 
 from __future__ import print_function
@@ -46,7 +62,6 @@ tf.config.threading.set_intra_op_parallelism_threads(0)
 tf.config.threading.set_inter_op_parallelism_threads(0)
 
 CHUNK_LEN = 2000          # time frames per model.predict call (for eval)
-HEAD_START = 'conv7'      # first layer of the trainable decision head
 
 
 # --------------------------------------------------------------------------
@@ -78,7 +93,15 @@ def f0_to_points(times, freqs):
 
 
 def featurize(pump, wav_path):
-    """Whole-file HCQT mag + phase-diff as (H, F, T) arrays."""
+    """Whole-file HCQT mag + phase-diff as (H, F, T) arrays.
+
+    NB orientation: pumpp emits (time, freq, harmonic); we transpose (2,1,0) to
+    (H, F, T) -- matching the TRAINING code (utils_train.patch_generator), which
+    is the convention model3's weights were fit on. This is intentionally NOT the
+    transpose predict_on_audio.get_single_test_prediction uses; that path applies
+    a (1,2,0) meant for a (channel,freq,time) layout to pumpp's (time,freq,channel)
+    output, which is a known mismatch. Staying with the training convention keeps
+    fine-tuning and evaluation consistent with how the model was trained."""
     feats = utils.compute_pump_features_segmented(pump, wav_path)
     mag = feats['dphase/mag'][0]        # (T, F, H)
     dph = feats['dphase/dphase'][0]     # (T, F, H)
@@ -175,24 +198,47 @@ def prepare(pump, train_dir, cache_dir, win=50, hop=None, recompute=False):
 # --------------------------------------------------------------------------
 # Model
 # --------------------------------------------------------------------------
-def build_and_freeze(weights_path, unfreeze_harm=False):
+def set_trainable(model, strategy):
+    """strategy in {'bn', 'full'}. 'head' is intentionally absent: a quiet voice
+    is lost before the head, so adapting only the head cannot recover it."""
+    if strategy == 'full':
+        for layer in model.layers:
+            layer.trainable = True
+    elif strategy == 'bn':
+        # AdaBN: only BatchNorm adapts (weights frozen). trainable=True keeps BN
+        # in training mode so its running stats recalibrate to the new amplitudes.
+        for layer in model.layers:
+            layer.trainable = isinstance(layer, tf.keras.layers.BatchNormalization)
+    else:
+        raise ValueError("unknown strategy %r (use 'bn' or 'full')" % strategy)
+
+
+def build_model(weights_path, strategy):
     model = models.build_model3()
     model.load_weights(weights_path)
-
-    # Freeze everything before the decision head; enable from HEAD_START on.
-    trainable = False
-    for layer in model.layers:
-        if layer.name == HEAD_START:
-            trainable = True
-        layer.trainable = trainable
-    if unfreeze_harm:
-        for layer in model.layers:
-            if layer.name.startswith('harm'):
-                layer.trainable = True
-
-    n_tr = sum(1 for l in model.layers if l.trainable)
-    print("Trainable layers (%d): %s" % (n_tr, [l.name for l in model.layers if l.trainable]))
+    set_trainable(model, strategy)
+    tr = [l.name for l in model.layers if l.trainable]
+    print("Strategy '%s': %d trainable layers %s"
+          % (strategy, len(tr), tr if len(tr) <= 12 else '(%d layers)' % len(tr)))
     return model
+
+
+def make_bkld(pos_weight=1.0):
+    """bkld (Brian's KL divergence) loss, optionally upweighting positive
+    (annotated voice) target bins by pos_weight."""
+    eps = 1e-7
+    pw = float(pos_weight)
+
+    def loss(y_true, y_pred):
+        y_true = tf.clip_by_value(y_true, eps, 1.0 - eps)
+        y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
+        per = -(y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
+        if pw != 1.0:
+            w = 1.0 + (pw - 1.0) * tf.cast(y_true > 0.5, per.dtype)
+            per = per * w
+        return tf.reduce_mean(per)
+
+    return loss
 
 
 def predict_salience(model, mag, dph):
@@ -210,33 +256,41 @@ def predict_salience(model, mag, dph):
 # --------------------------------------------------------------------------
 # Validation: invariance gap on matched pairs
 # --------------------------------------------------------------------------
-def _recall_precision(pump, model, wav, f0_csv, thresh):
+def _eval_file(pump, model, wav, f0_csv, thresh, loss_fn):
+    """Return (recall, precision, val_loss) for one file. val_loss is the same
+    (bkld) loss used in training, computed on the inference-mode full-file
+    prediction vs. the target."""
     import mir_eval
     mag, dph = featurize(pump, wav)
-    sal = predict_salience(model, mag, dph)
+    sal = predict_salience(model, mag, dph)          # (F, T), BN in inference mode
+    tgt = build_target(sal.shape[1], f0_csv)         # (F, T)
+    loss = float(loss_fn(tf.constant(tgt[np.newaxis]), tf.constant(sal[np.newaxis])))
     est_t, est_f = utils_train.pitch_activations_to_mf0(sal, thresh)
     ref_t, ref_f = load_ragged_f0(f0_csv)
     m = mir_eval.multipitch.evaluate(ref_t, ref_f, np.array(est_t), est_f)
-    return m['Recall'], m['Precision']
+    return m['Recall'], m['Precision'], loss
 
 
-def evaluate_invariance(pump, model, valid_dir, thresh):
+def evaluate_invariance(pump, model, valid_dir, thresh, loss_fn):
     """For each matched pair, recall on balanced vs victim (same notes).
-    Returns dict with mean recalls, the gap, and balanced precision."""
+    Returns dict with mean recalls, the gap, balanced precision, and the mean
+    validation loss (over both balanced and victim files)."""
     bal_files = sorted(glob.glob(os.path.join(valid_dir, 'valid_*_balanced.wav')))
-    rb, rv, pb = [], [], []
+    rb, rv, pb, lb, lv = [], [], [], [], []
     for bwav in bal_files:
         idx = os.path.basename(bwav).split('_')[1]
-        vic = glob.glob(os.path.join(valid_dir, 'valid_%s_victim_*.wav' % idx))
+        vic = glob.glob(os.path.join(valid_dir, 'valid_%s_victim*.wav' % idx))
         if not vic:
             continue
-        recall_b, prec_b = _recall_precision(pump, model, bwav, bwav[:-4] + '.f0.csv', thresh)
-        recall_v, _ = _recall_precision(pump, model, vic[0], vic[0][:-4] + '.f0.csv', thresh)
+        recall_b, prec_b, loss_b = _eval_file(pump, model, bwav, bwav[:-4] + '.f0.csv', thresh, loss_fn)
+        recall_v, _, loss_v = _eval_file(pump, model, vic[0], vic[0][:-4] + '.f0.csv', thresh, loss_fn)
         rb.append(recall_b); rv.append(recall_v); pb.append(prec_b)
+        lb.append(loss_b); lv.append(loss_v)
     if not rb:
         return None
-    rb, rv, pb = np.mean(rb), np.mean(rv), np.mean(pb)
-    return dict(recall_balanced=rb, recall_victim=rv, gap=rb - rv, precision_balanced=pb)
+    return dict(recall_balanced=np.mean(rb), recall_victim=np.mean(rv),
+                gap=np.mean(rb) - np.mean(rv), precision_balanced=np.mean(pb),
+                loss_balanced=np.mean(lb), loss_victim=np.mean(lv))
 
 
 # --------------------------------------------------------------------------
@@ -256,35 +310,66 @@ def train(args):
     if not win_files:
         raise SystemExit("No windows to train on. Render the MIDIs to wav first.")
 
-    model = build_and_freeze(args.weights, unfreeze_harm=args.unfreeze_harm)
-    model.compile(loss=utils_train.bkld,
-                  metrics=['mse', utils_train.soft_binary_accuracy],
-                  optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr))
+    model = build_model(args.weights, args.strategy)
+    opt = tf.keras.optimizers.Adam(learning_rate=args.lr)
+    loss_fn = make_bkld(args.pos_weight)
+
+    # L2-SP: snapshot pretrained conv/dense kernels so we can penalise deviation
+    # from them (anchors 'full' fine-tuning against forgetting).
+    anchors = []
+    if args.l2sp > 0:
+        anchors = [(v, tf.constant(v.numpy()))
+                   for v in model.trainable_variables if 'kernel' in v.name]
+        print("L2-SP anchoring %d kernels (lambda=%g)" % (len(anchors), args.l2sp))
+
+    @tf.function
+    def train_step(x1, x2, y):
+        with tf.GradientTape() as tape:
+            pred = model([x1, x2], training=True)
+            loss = loss_fn(y, pred)
+            if anchors:
+                loss = loss + args.l2sp * tf.add_n(
+                    [tf.reduce_sum(tf.square(v - v0)) for v, v0 in anchors])
+        grads = tape.gradient(loss, model.trainable_variables)
+        opt.apply_gradients(zip(grads, model.trainable_variables))
+        return loss
+
+    # Pre-training baseline so we can require the balanced case not to regress.
+    baseline = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn) if args.valid_dir else None
+    if baseline is not None:
+        print("baseline    | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec_bal=%.3f"
+              % (baseline['loss_balanced'], baseline['loss_victim'],
+                 baseline['recall_balanced'], baseline['recall_victim'],
+                 baseline['gap'], baseline['precision_balanced']))
 
     rng = np.random.RandomState(args.seed)
     bs = args.batch_size
-    best_gap = None
+    best_victim = None
     for epoch in range(args.epochs):
         order = rng.permutation(len(win_files))
         losses = []
         for b in range(0, len(order), bs):
             batch = [np.load(win_files[i]) for i in order[b:b+bs]]
-            x1 = np.stack([d['mag'] for d in batch])   # (B, F, win, H)
-            x2 = np.stack([d['dph'] for d in batch])
-            y = np.stack([d['tgt'] for d in batch])    # (B, F, win)
-            losses.append(model.train_on_batch([x1, x2], y)[0])
+            x1 = tf.convert_to_tensor(np.stack([d['mag'] for d in batch]), tf.float32)
+            x2 = tf.convert_to_tensor(np.stack([d['dph'] for d in batch]), tf.float32)
+            y = tf.convert_to_tensor(np.stack([d['tgt'] for d in batch]), tf.float32)
+            losses.append(float(train_step(x1, x2, y)))
 
-        msg = "epoch %d/%d  loss=%.4f" % (epoch + 1, args.epochs, float(np.mean(losses)))
+        msg = "epoch %d/%d  train_loss=%.4f" % (epoch + 1, args.epochs, float(np.mean(losses)))
         if args.valid_dir:
-            inv = evaluate_invariance(pump, model, args.valid_dir, args.thresh)
+            inv = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn)
             if inv is not None:
-                msg += ("  | recall bal=%.3f victim=%.3f  GAP=%.3f  prec_bal=%.3f"
-                        % (inv['recall_balanced'], inv['recall_victim'],
+                msg += ("  | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec_bal=%.3f"
+                        % (inv['loss_balanced'], inv['loss_victim'],
+                           inv['recall_balanced'], inv['recall_victim'],
                            inv['gap'], inv['precision_balanced']))
-                # select on smallest gap that keeps balanced precision healthy
-                score = inv['gap']
-                if best_gap is None or score < best_gap:
-                    best_gap = score
+                # keep the epoch with highest quiet-voice recall, PROVIDED the
+                # balanced side did not regress beyond bal_tol vs. baseline.
+                ok = baseline is None or (
+                    inv['recall_balanced'] >= baseline['recall_balanced'] - args.bal_tol and
+                    inv['precision_balanced'] >= baseline['precision_balanced'] - args.bal_tol)
+                if ok and (best_victim is None or inv['recall_victim'] > best_victim):
+                    best_victim = inv['recall_victim']
                     model.save_weights(args.out)
                     msg += "  [saved best]"
         else:
@@ -293,8 +378,12 @@ def train(args):
 
     if not args.valid_dir:
         print("Saved final weights to %s" % args.out)
+    elif best_victim is None:
+        model.save_weights(args.out)
+        print("No epoch improved quiet-voice recall within the balanced guard; "
+              "saved final-epoch weights to %s" % args.out)
     else:
-        print("Best (smallest-gap) weights saved to %s" % args.out)
+        print("Best (highest quiet-voice recall, balanced preserved) weights saved to %s" % args.out)
 
 
 if __name__ == '__main__':
@@ -317,8 +406,18 @@ if __name__ == '__main__':
     p.add_argument('--epochs', type=int, default=6)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--thresh', type=float, default=0.5, help='peak threshold for eval')
-    p.add_argument('--unfreeze_harm', action='store_true',
-                   help='also fine-tune harm1/harm2 (fallback if head-only underfits)')
     p.add_argument('--seed', type=int, default=0)
+
+    p.add_argument('--strategy', choices=['bn', 'full'], default='full',
+                   help="which weights adapt: 'bn' = AdaBN recalibration only "
+                        "(cheap, try first); 'full' = all layers (pair with --l2sp)")
+    p.add_argument('--l2sp', type=float, default=1e-3,
+                   help='L2-SP anchor strength for full fine-tuning (0 disables). '
+                        'Penalises deviation of conv kernels from pretrained values.')
+    p.add_argument('--pos_weight', type=float, default=1.0,
+                   help='loss upweight on annotated (voice) target bins (1.0 = off)')
+    p.add_argument('--bal_tol', type=float, default=0.03,
+                   help='max allowed regression of balanced recall/precision vs baseline '
+                        'when selecting the best epoch')
 
     train(p.parse_args())

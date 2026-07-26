@@ -36,7 +36,8 @@ Two splits:
   * train/  -- per-chord randomized balance (balanced + single-victim +
                random-all), quiet levels oversampled.
   * valid/  -- MATCHED PAIRS: the same notes rendered once balanced and once
-               with a single victim voice quiet. This is the probe for the
+               with ONE quiet voice per chord (the victim voice cycles chord-to-
+               chord so every voice is exercised). This is the probe for the
                "invariance gap" (quiet-voice recall must rise, balanced must not
                regress) used to select the fine-tuning epoch.
 
@@ -298,22 +299,22 @@ def assign_balance_train(rng, chords):
             note.cc7 = cc7_from_db(note.db)
 
 
-def assign_balance_valid(chords, victim_voice_idx, victim_db):
+def assign_balance_valid(chords, victim_db, offset=0):
     """Two variants sharing identical notes: 'balanced' (all 0 dB) and 'victim'
-    (victim voice quiet in every chord). Returns (balanced_notes, victim_notes)
+    (ONE quiet voice PER CHORD, the victim voice cycling chord-to-chord so all
+    voices are exercised within the validation set). `offset` seeds the cycle so
+    it continues unbroken across scenes. Returns (balanced_notes, victim_notes)
     as flat lists of copies differing only in db/cc7."""
-    def clone(db_fn):
-        out = []
-        for chord in chords:
-            for note in chord:
-                c = Note(note.voice_idx, note.midi, note.onset, note.offset, note.vowel, 0.0)
-                c.db = db_fn(note)
-                c.cc7 = cc7_from_db(c.db)
-                out.append(c)
-        return out
-
-    balanced = clone(lambda note: 0.0)
-    victim = clone(lambda note: victim_db if note.voice_idx == victim_voice_idx else 0.0)
+    balanced, victim = [], []
+    for j, chord in enumerate(chords):
+        vidx = (offset + j) % N_VOICES               # this chord's victim voice
+        for note in chord:
+            b = Note(note.voice_idx, note.midi, note.onset, note.offset, note.vowel, 0.0)
+            balanced.append(b)                        # b.db already 0.0
+            v = Note(note.voice_idx, note.midi, note.onset, note.offset, note.vowel, 0.0)
+            v.db = victim_db if note.voice_idx == vidx else 0.0
+            v.cc7 = cc7_from_db(v.db)
+            victim.append(v)
     return balanced, victim
 
 
@@ -405,24 +406,28 @@ def main(args):
         total_sec += scene_end
 
     # ---- validation matched pairs ----
+    victim_offset = 0                       # cycles the per-chord victim across scenes
     for i in range(args.valid_scenes):
         chords, scene_end = gen_scene(rng, cfg)
-        victim_idx = i % N_VOICES               # cycle victim across all voices
-        balanced, victim = assign_balance_valid(chords, victim_idx, args.valid_victim_db)
-        vname = VOICES[victim_idx]['name']
+        balanced, victim = assign_balance_valid(chords, args.valid_victim_db, victim_offset)
+        victim_offset += len(chords)        # continue the cycle unbroken
 
         b_base = os.path.join(valid_dir, 'valid_%04d_balanced' % i)
         notes_to_midi(b_base + '.mid', balanced)
         notes_to_annotation(b_base + '.f0.csv', balanced, scene_end)
+        notes_to_debug_csv(b_base + '.notes.csv', balanced)
 
-        v_base = os.path.join(valid_dir, 'valid_%04d_victim_%s' % (i, vname))
+        # victim voice now varies per chord, so the file is not named after one voice
+        v_base = os.path.join(valid_dir, 'valid_%04d_victim' % i)
         notes_to_midi(v_base + '.mid', victim)
         notes_to_annotation(v_base + '.f0.csv', victim, scene_end)
-        # the victim annotation intentionally still contains the quiet voice
+        notes_to_debug_csv(v_base + '.notes.csv', victim)
+        
+        # the victim annotation intentionally still contains the quiet voices
 
         manifest.append(['valid', 'valid_%04d_balanced' % i, 'balanced', ''])
-        manifest.append(['valid', 'valid_%04d_victim_%s' % (i, vname), 'victim',
-                         '%s@%.0fdB' % (vname, args.valid_victim_db)])
+        manifest.append(['valid', 'valid_%04d_victim' % i, 'victim',
+                         'per-chord@%.0fdB' % args.valid_victim_db])
         total_sec += 2 * scene_end
 
     with open(os.path.join(args.out, 'manifest.csv'), 'w') as fh:
@@ -442,10 +447,10 @@ if __name__ == '__main__':
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--out', default='./finetune/data',
                    help='output directory (train/ and valid/ created inside)')
-    p.add_argument('--train_scenes', type=int, default=150)
-    p.add_argument('--valid_scenes', type=int, default=30,
+    p.add_argument('--train_scenes', type=int, default=5)
+    p.add_argument('--valid_scenes', type=int, default=1,
                    help='number of matched pairs (each yields balanced + victim)')
-    p.add_argument('--chords_per_scene', type=int, default=4)
+    p.add_argument('--chords_per_scene', type=int, default=120, help='number of chords per scene. For the victim validation scenes this must be a multiple of 6 so the victim voice cycles cleanly across chords.')
     p.add_argument('--seed', type=int, default=0)
 
     p.add_argument('--step_units', nargs='+', default=['eighth', 'quarter'],

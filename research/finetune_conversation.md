@@ -256,3 +256,119 @@ Stop at the epoch that maximizes the first without regressing the second. Your e
 ---
 
 **Summary of the recipe:** freeze `base_model` branches (BN in inference mode) → fine-tune `conv7/conv8/distribution/squishy` with Adam@1e-4, `bkld`, few epochs → data = balanced + quiet-oversampled with identical targets across levels → select on the balanced-vs-quiet invariance gap → escalate to unfreezing `harm1/harm2` or adding the consistency loss only if needed.
+
+---
+
+# Conversation: model3 architecture, frame timing, and real-time inference
+
+Date: 2026-07-26
+Repo: multif0-estimation-polyvocals
+
+Context: separate thread from the debiasing discussion above. Started from a question about which fine-tuning method suits a "soft voice in the mix" robustness problem, then moved into a detailed architectural read of `model3` itself (frame counts, hop size, real-time inference sizing, and conv kernel axis semantics). Kept here as reference material since it grounds the debiasing plan above in verified architectural facts.
+
+---
+
+## User
+
+I would like to fine-tune model3 of [predict_on_audio.py](https://github.com/helenacuesta/multif0-estimation-polyvocals/blob/master/predict_on_audio.py), so it performs better on when a voice is soft in the balance of an recorded audio. The output of the model remains the same. Which method would work well and why?
+
+## Assistant
+
+**Architecture (model3, "Late/Deep"):** two parallel fully-convolutional branches (`base_model`, one per HCQT-magnitude and phase-differential input) — `BN → conv1 (5×5) → conv2 (5×5) → conv3 (5×5) → conv4 (5×5) → harm1 (70×3) → harm2 (70×3)` each — concatenated at `conv7`, then `conv7/conv8 (3×3)` → `distribution (360×1)` → `squishy (1×1, sigmoid)`. No dense layers; BN after every conv, including on the raw input.
+
+**Diagnosis:** a soft-voice failure is an input-amplitude/SNR domain shift, not a new task. It originates at the input BN and the early/mid harmonic-detection layers (`conv1`–`harm2`), where a quiet voice's harmonics risk falling below the learned activation threshold — not fixable by only unfreezing the final 1×1 sigmoid layer.
+
+**Recommended method, in order:**
+1. **Data first:** synthesize soft-voice examples from multitrack stems (attenuate target voice −6 to −15 dB before remixing), annotations unchanged. Nothing else works without this.
+2. **Baseline: BatchNorm-only recalibration** (AdaBN, Li et al. 2016) — cheap, targets the amplitude-distribution shift directly, minimal forgetting risk.
+3. **If insufficient: full fine-tuning, low LR, with L2-SP regularization** (penalize deviation from pretrained weights, Xuhong et al. 2018) rather than plain weight decay — anchors the correction without erasing normal-balance performance.
+4. **Loss reweighting** on time-frequency bins near the soft voice's annotated F0, alongside either 2 or 3.
+5. **Validate on both** the soft-voice and normal-balance test sets throughout, to catch forgetting.
+
+(References cited: Yosinski et al. 2014 NeurIPS; Howard & Ruder 2018 ACL; Houlsby et al. 2019 ICML; Rebuffi et al. 2017 NeurIPS; Li et al. 2016 "Revisiting Batch Normalization for Practical Domain Adaptation"; Xuhong et al. 2018 ICML "L2-SP"; Kornblith et al. 2019 CVPR; Lawhern et al. 2018 J. Neural Eng. (EEGNet).)
+
+---
+
+## User
+
+Explain model3
+
+## Assistant
+
+Confirmed by pulling `models.py` and `predict_on_audio.py` directly. `model3` = two-stream **late fusion** ("Late/Deep" in Cuesta et al., ISMIR 2020): each of the HCQT-magnitude and phase-differential inputs passes through its own full 6-layer `base_model` tower (independent weights) before being concatenated at `conv7` — contrast with `model1`/`model2`, which fuse the two streams immediately after the first conv layer and share all subsequent layers ("early fusion").
+
+Per-stream `base_model`: `BN → conv1(16,5×5) → conv2(32,5×5) → conv3(32,5×5) → conv4(32,5×5) → harm1(32,70×3) → harm2(32,70×3)`, each followed by BN. `harm1`/`harm2`'s 70-bin kernel spans slightly over one octave (60 bins/octave), letting the layer relate a fundamental to its harmonic partials — this design descends from Bittner et al. 2017 ISMIR ("Deep Salience Representations for F0 Estimation in Polyphonic Music").
+
+Fusion head (shared): `conv7(64,3×3) → conv8(64,3×3) → distribution(8,360×1) → squishy(1,1×1,sigmoid)`. `distribution`'s 360-tap kernel spans the *entire* frequency axis, letting every output position resolve octave ambiguity using the full pitch range; `squishy` is a pointwise decision.
+
+Practical note: late fusion means the two towers can be fine-tuned at different rates/independently if the soft-voice failure is asymmetric between the magnitude and phase-differential branches.
+
+---
+
+## User
+
+How many samples are analysed at once? How much time does that represent?
+
+## Assistant
+
+Initial (later found to be based on a misread — see correction below): `predict_on_audio.py` appears to chunk inference into 5000-frame blocks. With `sr=22050`, `hop_length=256` → 11.61 ms/frame → 5000 × 11.61 ms ≈ **58.1 s** per chunk, reassembled via `np.hstack`.
+
+Noted: fully convolutional network, so chunk size is a memory-management choice, not an architectural limit. Temporal receptive field ≈ 24 frames (~280 ms) from summing `(k−1)` over all time-axis kernels — small relative to the (apparent) 58 s chunks, so boundary truncation seemed negligible.
+
+*(This chunking claim was later found to be incorrect — see the final exchange below.)*
+
+---
+
+## User
+
+The input model in the paper seems to have 50 frame deep input features. Is that correct? The batch normalisation is performed over all frames?
+
+## Assistant
+
+Confirmed via `utils_train.py`: `patch_size() = (360, 50)` — **training** patches are 360 freq bins × 50 time frames (≈ 580 ms), drawn as random crops (`grab_patch_input`/`patch_generator`). This is a *different* extent from the 5000-frame number above — that one is inference-only chunking, this one is training-time patch size. Fully-convolutional design is what allows training and inference to use different time extents.
+
+**BatchNorm scope:** Keras `BatchNormalization(axis=-1)` on a `(freq, time, channel)` layout computes each channel's mean/variance pooled over **the entire batch × all 360 freq bins × all 50 time frames** — one scalar per channel per training batch, accumulated into running stats via EMA. At inference, BN applies the frozen running stats uniformly to every frame/bin — it does not recompute from the current input.
+
+**Implication flagged:** because BN's statistics are pooled over the *whole* patch per channel, a single soft voice's narrow, localized harmonic sub-band is diluted in that aggregate — meaning **BN-only recalibration is weaker than initially suggested** for this specific, spatially localized failure mode, unless fine-tuning patches are curated so the soft-voice condition dominates the channel statistics. Reinforces the earlier recommendation that conv weight adaptation (not just BN) is likely necessary.
+
+---
+
+## User
+
+For real-time inference, how many frames should I use. Should I decrease the hop size?
+
+## Assistant
+
+**Look-ahead floor (architecture-derived, solid):** network is non-causal (`padding='same'`, centered kernels). Σ(k−1) over all time-axis kernels = 24 (4×(5−1) + 2×(3−1) per branch, + 2×(3−1) in the fusion head) → receptive field = 25 frames → **±12 frames (~139 ms) of unavoidable look-ahead** for output matching training-time context.
+
+**Streaming scheme:** run on a window of `N + 24` frames, keep only the central `N`, discard/overlap the ±12-frame margins. Initially gave a hand-wavy "N = 10–25" range without deriving it — corrected on follow-up (see below) with the actual redundant-compute-vs-latency tradeoff: `redundant_fraction = 24/(N+24)`, total latency ≈ 139 ms + N×11.61 ms + actual compute time. No single correct N — depends on the caller's latency budget vs. compute/throughput constraints.
+
+**Hop size:** keep `hop_length=256`, don't decrease without retraining. Two reasons: (1) compute scales ~linearly with frame rate for no accuracy gain unless paired with retraining; (2) the phase-differential branch is hop-dependent by construction (phase change between consecutive frames) — changing hop silently shifts that branch's input distribution out of what its BN/conv weights were calibrated on, likely worse than the soft-voice magnitude-branch mismatch discussed earlier. For finer time resolution, interpolate/overlap-average the *output*, not the input hop.
+
+---
+
+## User
+
+How do you know the 2D conv filters are in which domain? Why not in the frequency-bin domain?
+
+## Assistant
+
+Traced three independent lines of evidence, all converging on `(freq, time)` as the two convolved spatial axes (channel = harmonic index):
+
+1. **`patch_size()` naming**: `(360, 50)` = `(n_f, n_t)`, used consistently in `grab_patch_input`.
+2. **Storage-order slicing**: `grab_patch_input` indexes on-disk arrays as `x_data[channel, f:f+n_f, t:t+n_t]` (axis 0 = harmonic, not sliced) then `transpose(1,2,0)` → `(freq, time, channel)` before hitting the network.
+3. **Layer-name/kernel-size semantics, independent of code**: `harm1`/`harm2`'s `(70,3)` kernel — 70 ≈ slightly over one octave at 60 bins/octave, exactly the span needed to relate a fundamental to nearby harmonic partials (Bittner et al. 2017); `distribution`'s `(360,1)` — the full frequency axis, one time frame, matching its role of producing a per-frame pitch distribution. Swapped axes would make both layers architecturally incoherent.
+
+**Correction surfaced while tracing this:** independently checked pumpp's own source (`HCQT._index()` docstring: input `(channels, bins, time)` → output `(time, bins, channels)` for `channels_last`). `predict_on_audio.py`'s `get_single_test_prediction()` applies a `transpose(1,2,0)` appropriate for the *training-storage* convention `(channel, freq, time)` to pumpp's *own* `(time, freq, channel)` output instead — a mismatch. Concretely: this leaves the harmonics axis (constant size 5) sitting where `n_t = input_hcqt.shape[2]` expects the frame count, so `t_slices = arange(0, 5, 5000)` always evaluates to `[0]`, and the subsequent slice `[:, :, 0:5000, :]` is a no-op on a size-5 axis. **The chunking loop never actually chunks** — every call processes the entire track's time axis in a single `model.predict()`, regardless of length. This corrects the earlier "58 s chunk" answer: `predict_on_audio.py`'s inference path is not chunked in practice; it depends on holding the whole track in memory. Doesn't invalidate the real-time streaming scheme proposed above (that's a scheme to implement independently), but the script itself isn't a valid template for chunked inference.
+
+---
+
+## User
+
+So the 2Dconv are not applied to the bins-channel domain?
+
+## Assistant
+
+Correct. `Conv2D(filters=F, kernel_size=(kh,kw))` has weight shape `(kh, kw, C_in, F)` — the kernel slides over the two spatial axes (`freq`, `time`) only. At every spatial location it takes a full, non-strided sum over the *entire* input channel depth (5 harmonics at the first layer, 16/32/64 downstream) — a fully-connected contraction across channels, not a sliding window across them. Same as an RGB-image CNN convolving over `(height, width)` while fully mixing the 3 color channels at each location — nobody calls that "convolving over the color-channel domain."
+
+Practical note: per-harmonic-channel selectivity (e.g. to isolate which harmonic index drives a soft-voice false negative) is only inspectable at the very first conv layer's input-channel-sliced weights (`conv1a`) — after that, harmonic identity is blended into the output feature channels and not recoverable from architecture alone.
