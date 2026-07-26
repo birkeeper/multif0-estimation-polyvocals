@@ -105,7 +105,7 @@ def n(name):
 
 
 VOICES = [
-    # name, instrument, lo, hi, doo program, da program (all bank 0)
+    # name, instrument, lo, hi, doo program, da program (all bank 1)
     dict(name='S1', inst='soprano', lo=n('F3'), hi=n('A5'), doo=1, da=11),   # soprano
     dict(name='S2', inst='soprano', lo=n('F3'), hi=n('A5'), doo=1, da=11),   # mezzo
     dict(name='A',  inst='alto',    lo=n('C3'), hi=n('F5'), doo=2, da=12),   # alto
@@ -328,7 +328,7 @@ def notes_to_midi(path, notes):
         tr.name(v['name'])
         ch = vi                       # channels 0..5 (none is the percussion ch 9)
         tr.control(0, ch, 0, 0)       # bank select MSB = 0
-        tr.control(0, ch, 32, 0)      # bank select LSB = 0
+        tr.control(0, ch, 32, 1)      # bank select LSB = 1
         seq = sorted([note for note in notes if note.voice_idx == vi], key=lambda x: x.onset)
         last_program = None
         for note in seq:
