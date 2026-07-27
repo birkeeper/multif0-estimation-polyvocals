@@ -276,20 +276,21 @@ def evaluate_invariance(pump, model, valid_dir, thresh, loss_fn):
     Returns dict with mean recalls, the gap, balanced precision, and the mean
     validation loss (over both balanced and victim files)."""
     bal_files = sorted(glob.glob(os.path.join(valid_dir, 'valid_*_balanced.wav')))
-    rb, rv, pb, lb, lv = [], [], [], [], []
+    rb, rv, pb, pv, lb, lv = [], [], [], [], [], []
     for bwav in bal_files:
         idx = os.path.basename(bwav).split('_')[1]
         vic = glob.glob(os.path.join(valid_dir, 'valid_%s_victim*.wav' % idx))
         if not vic:
             continue
         recall_b, prec_b, loss_b = _eval_file(pump, model, bwav, bwav[:-4] + '.f0.csv', thresh, loss_fn)
-        recall_v, _, loss_v = _eval_file(pump, model, vic[0], vic[0][:-4] + '.f0.csv', thresh, loss_fn)
-        rb.append(recall_b); rv.append(recall_v); pb.append(prec_b)
+        recall_v, prec_v, loss_v = _eval_file(pump, model, vic[0], vic[0][:-4] + '.f0.csv', thresh, loss_fn)
+        rb.append(recall_b); rv.append(recall_v); pb.append(prec_b); pv.append(prec_v)
         lb.append(loss_b); lv.append(loss_v)
     if not rb:
         return None
     return dict(recall_balanced=np.mean(rb), recall_victim=np.mean(rv),
                 gap=np.mean(rb) - np.mean(rv), precision_balanced=np.mean(pb),
+                precision_victim=np.mean(pv),
                 loss_balanced=np.mean(lb), loss_victim=np.mean(lv))
 
 
@@ -309,6 +310,9 @@ def train(args):
                         win=args.win, hop=args.win_hop, recompute=args.recompute)
     if not win_files:
         raise SystemExit("No windows to train on. Render the MIDIs to wav first.")
+    if args.TEST is not None:
+        win_files = win_files[:args.TEST]
+        print("--TEST: limiting to %d window(s)" % len(win_files))
 
     model = build_model(args.weights, args.strategy)
     opt = tf.keras.optimizers.Adam(learning_rate=args.lr)
@@ -337,14 +341,15 @@ def train(args):
     # Pre-training baseline so we can require the balanced case not to regress.
     baseline = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn) if args.valid_dir else None
     if baseline is not None:
-        print("baseline    | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec_bal=%.3f"
+        print("baseline    | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec bal=%.3f victim=%.3f"
               % (baseline['loss_balanced'], baseline['loss_victim'],
                  baseline['recall_balanced'], baseline['recall_victim'],
-                 baseline['gap'], baseline['precision_balanced']))
+                 baseline['gap'], baseline['precision_balanced'], baseline['precision_victim']))
 
     rng = np.random.RandomState(args.seed)
     bs = args.batch_size
     best_victim = None
+    history = []
     for epoch in range(args.epochs):
         order = rng.permutation(len(win_files))
         losses = []
@@ -363,10 +368,11 @@ def train(args):
         if args.valid_dir:
             inv = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn)
             if inv is not None:
-                msg += ("  | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec_bal=%.3f"
+                history.append(dict(epoch=epoch + 1, **inv))
+                msg += ("  | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec bal=%.3f victim=%.3f"
                         % (inv['loss_balanced'], inv['loss_victim'],
                            inv['recall_balanced'], inv['recall_victim'],
-                           inv['gap'], inv['precision_balanced']))
+                           inv['gap'], inv['precision_balanced'], inv['precision_victim']))
                 # keep the epoch with highest quiet-voice recall, PROVIDED the
                 # balanced side did not regress beyond bal_tol vs. baseline.
                 ok = baseline is None or (
@@ -401,6 +407,9 @@ if __name__ == '__main__':
                    help='where to write fine-tuned weights (must end .weights.h5)')
     p.add_argument('--cache', default=None, help='chord-segment cache dir (default <train_dir>/_cache)')
     p.add_argument('--recompute', action='store_true', help='rebuild the feature cache')
+    p.add_argument('--TEST', type=int, default=None,
+                   help='use only the first N cached windows, to smoke-test the '
+                        'full setup without running on the whole training set')
 
     p.add_argument('--win', type=int, default=50, help='training window length (frames)')
     p.add_argument('--win_hop', type=int, default=None, help='window stride (default win//2)')
