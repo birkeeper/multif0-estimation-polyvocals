@@ -348,12 +348,16 @@ def train(args):
     for epoch in range(args.epochs):
         order = rng.permutation(len(win_files))
         losses = []
-        for b in range(0, len(order), bs):
+        n_batches = (len(order) + bs - 1) // bs
+        for bi, b in enumerate(range(0, len(order), bs)):
             batch = [np.load(win_files[i]) for i in order[b:b+bs]]
             x1 = tf.convert_to_tensor(np.stack([d['mag'] for d in batch]), tf.float32)
             x2 = tf.convert_to_tensor(np.stack([d['dph'] for d in batch]), tf.float32)
             y = tf.convert_to_tensor(np.stack([d['tgt'] for d in batch]), tf.float32)
             losses.append(float(train_step(x1, x2, y)))
+            print("\r  batch %d/%d  loss=%.4f" % (bi + 1, n_batches, losses[-1]),
+                  end='', flush=True)
+        print()
 
         msg = "epoch %d/%d  train_loss=%.4f" % (epoch + 1, args.epochs, float(np.mean(losses)))
         if args.valid_dir:
