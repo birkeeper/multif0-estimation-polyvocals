@@ -271,11 +271,14 @@ def _eval_file(pump, model, wav, f0_csv, thresh, loss_fn):
     return m['Recall'], m['Precision'], loss
 
 
-def evaluate_invariance(pump, model, valid_dir, thresh, loss_fn):
+def evaluate_invariance(pump, model, valid_dir, thresh, loss_fn, limit=None):
     """For each matched pair, recall on balanced vs victim (same notes).
     Returns dict with mean recalls, the gap, balanced precision, and the mean
-    validation loss (over both balanced and victim files)."""
+    validation loss (over both balanced and victim files). `limit` caps the
+    number of matched pairs evaluated (for --TEST smoke runs)."""
     bal_files = sorted(glob.glob(os.path.join(valid_dir, 'valid_*_balanced.wav')))
+    if limit is not None:
+        bal_files = bal_files[:limit]
     rb, rv, pb, pv, lb, lv = [], [], [], [], [], []
     for bwav in bal_files:
         idx = os.path.basename(bwav).split('_')[1]
@@ -339,7 +342,8 @@ def train(args):
         return loss
 
     # Pre-training baseline so we can require the balanced case not to regress.
-    baseline = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn) if args.valid_dir else None
+    baseline = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn,
+                                    limit=args.TEST) if args.valid_dir else None
     if baseline is not None:
         print("baseline    | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec bal=%.3f victim=%.3f"
               % (baseline['loss_balanced'], baseline['loss_victim'],
@@ -366,7 +370,8 @@ def train(args):
 
         msg = "epoch %d/%d  train_loss=%.4f" % (epoch + 1, args.epochs, float(np.mean(losses)))
         if args.valid_dir:
-            inv = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn)
+            inv = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn,
+                                       limit=args.TEST)
             if inv is not None:
                 history.append(dict(epoch=epoch + 1, **inv))
                 msg += ("  | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec bal=%.3f victim=%.3f"
@@ -408,8 +413,9 @@ if __name__ == '__main__':
     p.add_argument('--cache', default=None, help='chord-segment cache dir (default <train_dir>/_cache)')
     p.add_argument('--recompute', action='store_true', help='rebuild the feature cache')
     p.add_argument('--TEST', type=int, default=None,
-                   help='use only the first N cached windows, to smoke-test the '
-                        'full setup without running on the whole training set')
+                   help='use only the first N cached windows and the first N valid '
+                        'pairs, to smoke-test the full setup without running on the '
+                        'whole training/validation set')
 
     p.add_argument('--win', type=int, default=50, help='training window length (frames)')
     p.add_argument('--win_hop', type=int, default=None, help='window stride (default win//2)')
