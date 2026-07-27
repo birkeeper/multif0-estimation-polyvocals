@@ -41,12 +41,13 @@ Two splits:
                "invariance gap" (quiet-voice recall must rise, balanced must not
                regress) used to select the fine-tuning epoch.
 
-IMPORTANT -- CC7 -> dB mapping. The dB levels below assume the PWA interprets
-CC7 as a LINEAR amplitude gain (gain = cc/100), with the default CC7=100 taken
-as 0 dB, giving dB = 20*log10(cc/100). If your PWA uses a different volume
-curve, adjust ``cc7_from_db`` so the intended relative dB between voices is
-what actually gets rendered. Only the *relative* levels matter (the model is
-globally gain-invariant).
+IMPORTANT -- CC7 -> dB mapping. The PWA (SpessaSynth_core) derives attenuation
+from CC7 as attenuation_dB = -40*log10(cc7 * 128 / 16385), i.e.
+cc7 = round(16385 * 10**(-attenuation_dB/40) / 128), with cc7=127/128 sitting
+at ~0 dB attenuation (max volume). The LEVELS_DB below are defined relative to
+the DEFAULT CC7=100 (which itself sits at CC7100_ATTEN_DB of attenuation below
+max), not relative to max volume -- see ``cc7_from_db``. Only the *relative*
+levels matter (the model is globally gain-invariant).
 
 The soundfont (Choir_practice.sf2) bank/program + ranges are baked in below.
 """
@@ -124,12 +125,22 @@ LEVELS_DB = [0.0, -6.0, -12.0, -18.0]
 VICTIM_DB_CHOICES = [-6.0, -12.0, -12.0, -18.0, -18.0]
 
 
+SPESSA_MAX_CC7 = 16385.0 / 128.0           # SpessaSynth_core's CC7 -> gain scale
+
+# Attenuation (dB below max volume) of the default CC7=100, per SpessaSynth_core's
+# own formula. LEVELS_DB are defined relative to *this*, not to max volume.
+CC7100_ATTEN_DB = -40.0 * math.log10(100 * 128.0 / 16385.0)
+
+
 def cc7_from_db(db):
-    """Map a target dB (<=0) to a CC7 value, assuming the PWA treats CC7 as a
-    linear amplitude gain (gain = cc/100), with 0 dB at the default CC7=100.
-    Adjust if your PWA differs."""
-    amp = 10.0 ** (db / 20.0)
-    return max(1, min(127, int(round(100 * amp))))
+    """Map a dB level -- defined relative to the default CC7=100 -- to a CC7
+    value, using SpessaSynth_core's actual attenuation curve:
+        attenuation_dB = -40*log10(cc7 * 128 / 16385)
+    i.e. cc7 = round(16385 * 10**(-attenuation_dB/40) / 128).
+    ``db`` here is (target level) - (CC7=100 level), so db=0 -> cc7=100."""
+    atten_db = CC7100_ATTEN_DB - db
+    cc7 = SPESSA_MAX_CC7 * 10.0 ** (-atten_db / 40.0)
+    return max(0, min(127, int(round(cc7))))
 
 
 def midi_to_freq(m):
