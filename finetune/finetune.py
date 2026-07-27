@@ -110,6 +110,21 @@ def featurize(pump, wav_path):
     return mag.astype(np.float32), dph.astype(np.float32)
 
 
+def featurize_cropped(pump, wav_path, duration):
+    """Like featurize(), but only loads/transforms the first `duration`
+    seconds of audio -- for fast --TEST validation, so the CQT is never run
+    over the whole (possibly long) file."""
+    import librosa
+    (_, _, _, sr, _, _, _) = utils.get_hcqt_params()
+    y, _ = librosa.load(wav_path, sr=sr, duration=duration)
+    feats = pump(y=y, sr=sr)
+    mag = feats['dphase/mag'][0]        # (T, F, H)
+    dph = feats['dphase/dphase'][0]     # (T, F, H)
+    mag = np.transpose(mag, (2, 1, 0))  # (H, F, T)
+    dph = np.transpose(dph, (2, 1, 0))
+    return mag.astype(np.float32), dph.astype(np.float32)
+
+
 def build_target(n_frames, f0_csv):
     """Blurred binary salience target (F, T) on the feature time grid."""
     freq_grid = utils.get_freq_grid()
@@ -121,11 +136,9 @@ def build_target(n_frames, f0_csv):
     return utils.create_annotation_target(freq_grid, time_grid, pts_t, pts_f).astype(np.float32)
 
 
-def segment_chords(target, gap_frames=8, min_frames=12):
-    """Return [(t0, t1), ...] for runs of active (non-silent) frames, merging
-    gaps shorter than gap_frames and dropping runs shorter than min_frames.
-    Uses the silent gaps the generator places between chords."""
-    active = target.sum(axis=0) > 1e-3
+def segment_active(active, gap_frames=8, min_frames=12):
+    """Return [(t0, t1), ...] for runs of True in `active`, merging gaps
+    shorter than gap_frames and dropping runs shorter than min_frames."""
     segs = []
     t = 0
     T = len(active)
@@ -146,6 +159,13 @@ def segment_chords(target, gap_frames=8, min_frames=12):
         if t1 - t0 >= min_frames:
             segs.append((t0, t1))
     return segs
+
+
+def segment_chords(target, gap_frames=8, min_frames=12):
+    """Return [(t0, t1), ...] for runs of active (non-silent) frames, merging
+    gaps shorter than gap_frames and dropping runs shorter than min_frames.
+    Uses the silent gaps the generator places between chords."""
+    return segment_active(target.sum(axis=0) > 1e-3, gap_frames, min_frames)
 
 
 # --------------------------------------------------------------------------
@@ -256,37 +276,91 @@ def predict_salience(model, mag, dph):
 # --------------------------------------------------------------------------
 # Validation: invariance gap on matched pairs
 # --------------------------------------------------------------------------
-def _eval_file(pump, model, wav, f0_csv, thresh, loss_fn):
+def crop_duration_for_chords(f0_csv, n_chords, pad=0.5):
+    """Return the audio duration (seconds) covering the first `n_chords` of
+    f0_csv, using the same silent-gap segmentation as segment_chords, but
+    applied directly to the annotation rows -- so this can run BEFORE any
+    audio is loaded or featurized. Returns None if there are fewer than
+    n_chords chords (caller should fall back to the whole file)."""
+    times, freqs = load_ragged_f0(f0_csv)
+    active = np.array([len(fr) > 0 for fr in freqs])
+    segs = segment_active(active)
+    if not segs or n_chords >= len(segs):
+        return None
+    last_row = segs[n_chords - 1][1] - 1
+    return float(times[last_row]) + pad
+
+
+def prepare_valid(pump, valid_dir, cache_dir, n_chords=None, recompute=False):
+    """Featurize each validation file once (cropped to the first `n_chords`
+    when given) and cache mag/dph/tgt to disk, one npz per file -- same
+    disk-cache pattern (DONE marker, skip recompute) as prepare() uses for
+    the training windows."""
+    os.makedirs(cache_dir, exist_ok=True)
+    done_marker = os.path.join(cache_dir, 'DONE')
+    if os.path.exists(done_marker) and not recompute:
+        print("Using cached validation features in %s" % cache_dir)
+        return
+
+    wav_files = sorted(glob.glob(os.path.join(valid_dir, 'valid_*.wav')))
+    for wav in wav_files:
+        f0 = wav[:-4] + '.f0.csv'
+        if not os.path.exists(f0):
+            continue
+        duration = crop_duration_for_chords(f0, n_chords) if n_chords is not None else None
+        if duration is not None:
+            mag, dph = featurize_cropped(pump, wav, duration)
+        else:
+            mag, dph = featurize(pump, wav)
+        tgt = build_target(mag.shape[2], f0)
+        stem = os.path.basename(wav)[:-len('.wav')]
+        np.savez_compressed(os.path.join(cache_dir, '%s.npz' % stem), mag=mag, dph=dph, tgt=tgt)
+    open(done_marker, 'w').close()
+    print("Cached features for %d validation files in %s" % (len(wav_files), cache_dir))
+
+
+def _load_valid_features(cache_dir, wav):
+    stem = os.path.basename(wav)[:-len('.wav')]
+    d = np.load(os.path.join(cache_dir, '%s.npz' % stem))
+    return d['mag'], d['dph'], d['tgt']
+
+
+def _eval_file(pump, model, cache_dir, wav, f0_csv, thresh, loss_fn, n_chords=None):
     """Return (recall, precision, val_loss) for one file. val_loss is the same
     (bkld) loss used in training, computed on the inference-mode full-file
-    prediction vs. the target."""
+    prediction vs. the target. mag/dph/tgt come from the on-disk validation
+    cache (see prepare_valid); `n_chords` only re-derives the crop cutoff
+    here to trim the reference annotation to match."""
     import mir_eval
-    mag, dph = featurize(pump, wav)
+    mag, dph, tgt = _load_valid_features(cache_dir, wav)
     sal = predict_salience(model, mag, dph)          # (F, T), BN in inference mode
-    tgt = build_target(sal.shape[1], f0_csv)         # (F, T)
     loss = float(loss_fn(tf.constant(tgt[np.newaxis]), tf.constant(sal[np.newaxis])))
     est_t, est_f = utils_train.pitch_activations_to_mf0(sal, thresh)
     ref_t, ref_f = load_ragged_f0(f0_csv)
+    if n_chords is not None:
+        duration = crop_duration_for_chords(f0_csv, n_chords)
+        if duration is not None:
+            keep = ref_t < duration
+            ref_t, ref_f = ref_t[keep], [f for f, k in zip(ref_f, keep) if k]
     m = mir_eval.multipitch.evaluate(ref_t, ref_f, np.array(est_t), est_f)
     return m['Recall'], m['Precision'], loss
 
 
-def evaluate_invariance(pump, model, valid_dir, thresh, loss_fn, limit=None):
+def evaluate_invariance(pump, model, valid_dir, cache_dir, thresh, loss_fn, n_chords=None):
     """For each matched pair, recall on balanced vs victim (same notes).
     Returns dict with mean recalls, the gap, balanced precision, and the mean
-    validation loss (over both balanced and victim files). `limit` caps the
-    number of matched pairs evaluated (for --TEST smoke runs)."""
+    validation loss (over both balanced and victim files). `n_chords` caps
+    each file's evaluation to its first N chords (for --TEST smoke runs);
+    features are read from the cache prepare_valid built."""
     bal_files = sorted(glob.glob(os.path.join(valid_dir, 'valid_*_balanced.wav')))
-    if limit is not None:
-        bal_files = bal_files[:limit]
     rb, rv, pb, pv, lb, lv = [], [], [], [], [], []
     for bwav in bal_files:
         idx = os.path.basename(bwav).split('_')[1]
         vic = glob.glob(os.path.join(valid_dir, 'valid_%s_victim*.wav' % idx))
         if not vic:
             continue
-        recall_b, prec_b, loss_b = _eval_file(pump, model, bwav, bwav[:-4] + '.f0.csv', thresh, loss_fn)
-        recall_v, prec_v, loss_v = _eval_file(pump, model, vic[0], vic[0][:-4] + '.f0.csv', thresh, loss_fn)
+        recall_b, prec_b, loss_b = _eval_file(pump, model, cache_dir, bwav, bwav[:-4] + '.f0.csv', thresh, loss_fn, n_chords)
+        recall_v, prec_v, loss_v = _eval_file(pump, model, cache_dir, vic[0], vic[0][:-4] + '.f0.csv', thresh, loss_fn, n_chords)
         rb.append(recall_b); rv.append(recall_v); pb.append(prec_b); pv.append(prec_v)
         lb.append(loss_b); lv.append(loss_v)
     if not rb:
@@ -308,7 +382,7 @@ def train(args):
 
     pump = utils.create_pump_object()
 
-    cache_dir = args.cache or os.path.join(args.train_dir, '_cache')
+    cache_dir = os.path.join(args.train_dir, '_cache')
     win_files = prepare(pump, args.train_dir, cache_dir,
                         win=args.win, hop=args.win_hop, recompute=args.recompute)
     if not win_files:
@@ -316,6 +390,12 @@ def train(args):
     if args.TEST is not None:
         win_files = win_files[:args.TEST]
         print("--TEST: limiting to %d window(s)" % len(win_files))
+
+    valid_cache_dir = None
+    if args.valid_dir:
+        valid_cache_dir = os.path.join(args.valid_dir, '_cache')
+        prepare_valid(pump, args.valid_dir, valid_cache_dir,
+                      n_chords=args.TEST, recompute=args.recompute)
 
     model = build_model(args.weights, args.strategy)
     opt = tf.keras.optimizers.Adam(learning_rate=args.lr)
@@ -342,8 +422,8 @@ def train(args):
         return loss
 
     # Pre-training baseline so we can require the balanced case not to regress.
-    baseline = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn,
-                                    limit=args.TEST) if args.valid_dir else None
+    baseline = evaluate_invariance(pump, model, args.valid_dir, valid_cache_dir, args.thresh, loss_fn,
+                                    n_chords=args.TEST) if args.valid_dir else None
     if baseline is not None:
         print("baseline    | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec bal=%.3f victim=%.3f"
               % (baseline['loss_balanced'], baseline['loss_victim'],
@@ -370,8 +450,8 @@ def train(args):
 
         msg = "epoch %d/%d  train_loss=%.4f" % (epoch + 1, args.epochs, float(np.mean(losses)))
         if args.valid_dir:
-            inv = evaluate_invariance(pump, model, args.valid_dir, args.thresh, loss_fn,
-                                       limit=args.TEST)
+            inv = evaluate_invariance(pump, model, args.valid_dir, valid_cache_dir, args.thresh, loss_fn,
+                                       n_chords=args.TEST)
             if inv is not None:
                 history.append(dict(epoch=epoch + 1, **inv))
                 msg += ("  | val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  prec bal=%.3f victim=%.3f"
@@ -410,12 +490,13 @@ if __name__ == '__main__':
                    help='model3 weights to fine-tune from')
     p.add_argument('--out', default='./models/exp3multif0_finetuned.weights.h5',
                    help='where to write fine-tuned weights (must end .weights.h5)')
-    p.add_argument('--cache', default=None, help='chord-segment cache dir (default <train_dir>/_cache)')
-    p.add_argument('--recompute', action='store_true', help='rebuild the feature cache')
+    p.add_argument('--recompute', action='store_true',
+                   help='rebuild the feature caches (<train_dir>/_cache and <valid_dir>/_cache)')
     p.add_argument('--TEST', type=int, default=None,
-                   help='use only the first N cached windows and the first N valid '
-                        'pairs, to smoke-test the full setup without running on the '
-                        'whole training/validation set')
+                   help='use only the first N cached windows for training, and crop '
+                        'each validation file to its first N chords (audio is cropped '
+                        'before featurization, so this stays fast), to smoke-test the '
+                        'full setup without running on the whole training/validation set')
 
     p.add_argument('--win', type=int, default=50, help='training window length (frames)')
     p.add_argument('--win_hop', type=int, default=None, help='window stride (default win//2)')
