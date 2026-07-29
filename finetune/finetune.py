@@ -634,7 +634,7 @@ if __name__ == '__main__':
     p.add_argument('--win', type=int, default=50, help='training window length (frames)')
     p.add_argument('--win_hop', type=int, default=None,
                    help='window stride in frames (default: --win, i.e. no overlap)')
-    p.add_argument('--batch_size', type=int, default=1,
+    p.add_argument('--batch_size', type=int, default=10,
                    help='windows per step. Keep small on CPU: the (360,1) distribution '
                         'layer backprop scales with batch*win (batch=1 ~1.6GB at win=50).')
     p.add_argument('--epochs', type=int, default=6)
