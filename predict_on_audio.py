@@ -25,6 +25,24 @@ tf.config.threading.set_inter_op_parallelism_threads(0)
 CHUNK_LEN = 2000
 
 
+def save_salience_map(salience, save_path, model_name, thresh):
+    """Store the raw (freq, time) salience map so it can be re-analysed without
+    re-running inference -- e.g. sweeping the threshold offline, or reading the
+    salience value at a known F0 instead of a binary detected/not-detected.
+
+    Saved as compressed float16 (salience is in [0, 1], so ~3 decimal digits is
+    ample) together with the frequency and time grids needed to interpret it.
+    """
+    freq_grid = utils.get_freq_grid()
+    time_grid = utils.get_time_grid(salience.shape[1])
+    np.savez_compressed(
+        save_path,
+        salience=salience.astype(np.float16),
+        freq_grid=freq_grid, time_grid=time_grid,
+        model_name=model_name, thresh=thresh,
+    )
+
+
 def get_single_test_prediction_phase_free(model, audio_file=None):
     """Generate output from a model given an input numpy file
     """
@@ -92,6 +110,7 @@ def main(args):
     audiofile = args.audiofile
     audio_folder = args.audio_folder
     plot_salience = args.plot_salience
+    save_salience = args.save_salience
 
     # load model weights
     if model_name == 'model1':
@@ -189,6 +208,11 @@ def main(args):
                 est_times, est_freqs, model_name=model_name
             )
 
+        if save_salience:
+            path = '{}_{}_salience.npz'.format(stem, model_name)
+            save_salience_map(predicted_output, path, model_name, thresh)
+            print(" > > > Salience map saved as {}.".format(path))
+
         # rearrange output
         for i, (tms, fqs) in enumerate(zip(est_times, est_freqs)):
             if any(fqs <= 0):
@@ -238,6 +262,13 @@ def main(args):
                     model_name=model_name
                 )
 
+            if save_salience:
+                path = os.path.join(
+                    audio_folder, '{}_{}_salience.npz'.format(stem, model_name)
+                )
+                save_salience_map(predicted_output, path, model_name, thresh)
+                print(" > > > Salience map saved as {}.".format(path))
+
             # rearrange output
             for i, (tms, fqs) in enumerate(zip(est_times, est_freqs)):
                 if any(fqs <= 0):
@@ -286,6 +317,16 @@ if __name__ == "__main__":
                         action='store_true',
                         help="If set, save a pitch salience (time-frequency) plot as a PNG "
                              "next to each output CSV, before it is converted into F0 estimates.")
+
+    parser.add_argument("--save_salience",
+                        dest='save_salience',
+                        action='store_true',
+                        help="If set, save the raw (frequency x time) salience map as a "
+                             "compressed .npz next to each output CSV, alongside its "
+                             "frequency and time grids. Lets the prediction be "
+                             "re-analysed later -- e.g. sweeping the threshold or "
+                             "reading the salience at a known F0 -- without re-running "
+                             "the model.")
 
     parser.add_argument("--thresh",
                         dest='thresh',

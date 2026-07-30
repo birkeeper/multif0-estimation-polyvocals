@@ -1,4 +1,4 @@
-# exp3multif0_finetuned.weights.h5
+# exp3multif0_finetuned_AdaBN.weights.h5
 
 Fine-tuned variant of `models/exp3multif0.h5` (model3, `models.build_model3()`),
 adapted by **AdaBN BatchNorm recalibration** on synthetic SSATBB choir chords in
@@ -232,16 +232,120 @@ unmasks the others.
 
 ---
 
-## 4. Limitations
+## 4. Evaluation on a real recording
 
-- **Synthetic audio only.** All training and validation material is
-  soundfont-rendered from generated MIDI. The model has not been evaluated on real
-  polyvocal recordings.
-- **Part of the gain is domain adaptation, not de-biasing.** AdaBN corrects the
-  statistics mismatch between model3's original real-recording training data and
-  these PWA renders. Because BN running statistics have been moved toward the
-  synthetic distribution, performance on *real* audio may be unchanged or worse.
-  Validate on real material before adopting this checkpoint for real input.
+All of §3 is synthetic. This section is the check that matters: the same real
+audio processed by the base model and by this one.
+
+**Material.** "Kenny B – Parijs", a recorded SSATB ensemble (5 voices: Sopraan,
+Mezzo, Alt, Tenor, Bas), measures 1–2, ~4.8 s, four distinct chords. The score
+MIDI supplies the ground-truth pitch of every voice at every instant. The
+performance runs faster than the score tempo and the choir sings flat, so a
+linear time warp and a global tuning offset are fitted before scoring; both
+models receive identical treatment.
+
+**Procedure.** Salience maps were saved for both models with
+`predict_on_audio.py --save_salience` and analysed with
+`finetune/compare_voice_salience.py`. Working from the raw salience rather than
+the output CSVs matters here: every voice has a salience value at its known F0
+whether or not it crossed the detection threshold, so a "missed" voice is a low
+number rather than absent data, and no result depends on the threshold.
+
+### 4.1 The fine-tuned model uniformly suppresses salience
+
+| | model3 | this model |
+|---|---|---|
+| mean salience | 0.0240 | 0.0188 (−22 %) |
+| bins > 0.5 | 2807 | 1847 (−34 %) |
+| peaks at thr 0.5 | 1128 | 951 |
+
+The suppression grows with activation strength — about −0.05 where model3 reads
+0.15, about −0.27 where it reads 0.75 — so it is close to a monotonic
+rescaling. The two maps correlate at r = 0.847. Consequently **this model at
+threshold 0.36 sits at the same operating point as model3 at 0.50** (1132 vs
+1128 peaks).
+
+### 4.2 Detection accuracy: no difference once the gain is corrected
+
+| comparison | model3 | this model |
+|---|---|---|
+| at the default thr 0.5 | P 0.824 R 0.643 **F 0.722** | P 0.842 R 0.555 **F 0.669** |
+| at a matched detection count | **F 0.722** (thr 0.50) | **F 0.726** (thr 0.36) |
+| each at its own best threshold | **F 0.743** (thr 0.15) | **F 0.745** (thr 0.25) |
+
+Compared fairly, the difference is +0.004 and +0.002 — noise. The salience map
+carries the same information as model3's; it is not better ordered, only scaled
+down. The apparent deficit at the default threshold is a calibration artifact,
+not a loss of accuracy.
+
+### 4.3 Evenness across voices — the property actually targeted
+
+Salience should indicate pitch *presence*, so the ideal output is uniformly high
+across all sounding voices regardless of how loudly each was sung. Per chord,
+relative to the loudest voice:
+
+| chord | spread, model3 | spread, this model | min/max, model3 | min/max, this model |
+|---|---|---|---|---|
+| 1 | 0.63 | 0.66 | 0.37 | 0.34 |
+| 2 | 0.30 | 0.44 | 0.70 | 0.56 |
+| 3 | 0.71 | 0.88 | 0.29 | 0.12 |
+| 4 | 0.53 | **0.45** | 0.47 | **0.55** |
+| **mean** | **0.540** | 0.606 | **0.460** | 0.394 |
+
+(spread = max − min of the relative values, smaller is more even; min/max =
+quietest voice relative to loudest, larger is better.)
+
+**The voices become less even, not more.** The quiet voice is better held in
+only 1 of 4 chords. Chord 4 is a genuine local success — the bass A2 is the only
+voice anywhere in the excerpt whose *absolute* salience rises (0.386 → 0.422)
+despite the 22 % global suppression, and it gains relative too. But chord 3
+moves as hard the other way: the bass D3 collapses from 0.29 to 0.12, and the
+alto D4 from 0.86 to 0.57. Same register, same kind of voice, opposite
+direction.
+
+### 4.4 Conclusion
+
+**The gain measured on synthetic data did not transfer to real audio.** On the
+synthetic matched pair this model gained +0.074 recall and +0.078 precision
+(§3); on real audio it gains nothing once the threshold is retuned, and the
+voice evenness it was built to improve gets worse on average. There is genuine
+per-voice redistribution happening — so the fine-tuning did learn *something*
+about low voices under masking — but on real recordings it fires more or less at
+random rather than on the quiet voice.
+
+This is the domain-adaptation risk in §5 materialising: BatchNorm statistics
+were recalibrated onto soundfont renders, so on real voices the model is
+differently calibrated rather than improved.
+
+**Practical guidance.** There is no reason to prefer this model over model3 for
+real recordings. If it is used, set `--thresh 0.36` to match model3's default
+operating point. Separately and more usefully: **`--thresh 0.5` is too high for
+real audio in general** — model3 peaks at 0.15 on this excerpt (F 0.743 vs
+0.722, trading precision 0.824 → 0.732 for recall 0.643 → 0.756). That single
+flag buys more than the entire fine-tuning did.
+
+**Caveats.** One 4.8-second excerpt, four chords, one ensemble — chord 4's
+success is well within what chance can produce at n = 4. The alignment is the
+weakest link: the tempo fit lands at 22 % faster than the score with a
+score/salience correlation of only r = 0.509, though the conclusions are
+unchanged across the range of plausible warps tested. The per-voice readings use
+a ±80-cent window around each nominal pitch, which assumes the singers stay
+inside it.
+
+---
+
+## 5. Limitations
+
+- **Synthetic training and validation material.** All of it is soundfont-rendered
+  from generated MIDI. The one real-audio evaluation (§4) is a single 4.8-second
+  excerpt of one ensemble.
+- **The gain is domain adaptation, not de-biasing — now confirmed.** AdaBN
+  corrects the statistics mismatch between model3's original real-recording
+  training data and these PWA renders. §4 shows the consequence directly: on real
+  audio the model is merely recalibrated (salience suppressed ~22 %), detection
+  accuracy is unchanged once the threshold is matched, and voice evenness is
+  slightly worse. Do not adopt this checkpoint for real input expecting the §3
+  improvement.
 - **One validation scene.** 120 chord pairs is a reasonable frame-level sample,
   but it is a single scene, single seed, single soundfont, and a single victim
   level (−12 dB). No error bars.
@@ -261,6 +365,4 @@ unmasks the others.
   recalibrates against. `--strategy full` (with a functioning L2-SP anchor) is the
   intended route to making the early harmonic detectors themselves keep a quiet
   voice above threshold.
-
----
 
