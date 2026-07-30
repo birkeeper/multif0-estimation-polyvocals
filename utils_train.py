@@ -427,7 +427,7 @@ def get_single_test_prediction(model, npy_file=None, audio_file=None):
     return predicted_output, input_hcqt, input_dphase
 
 def plot_salience(pitch_activation_mat, save_path=None,
-                  est_times=None, est_freqs=None):
+                  est_times=None, est_freqs=None, model_name=None):
     """Plot the pitch salience map (time x frequency) predicted by the model.
 
     If ``est_times`` and ``est_freqs`` (as returned by
@@ -435,6 +435,9 @@ def plot_salience(pitch_activation_mat, save_path=None,
     overlaid as points on top of the salience, so the effect of the
     threshold settings is directly visible (e.g. whether a quiet tenor's
     peaks survive).
+
+    ``model_name`` is added to the title, so plots from different models stay
+    distinguishable once saved.
     """
     (bins_per_octave, _, _, sr, fmin, hop_length, _) = utils.get_hcqt_params()
 
@@ -449,9 +452,9 @@ def plot_salience(pitch_activation_mat, save_path=None,
         bins_per_octave=bins_per_octave,
         cmap='inferno'
     )
-    plt.title('Pitch salience')
     plt.colorbar(label='Activation')
 
+    title = 'Pitch salience'
     if est_times is not None and est_freqs is not None:
         # Flatten the ragged (per-frame) detections into scatter points.
         xs, ys = [], []
@@ -466,7 +469,10 @@ def plot_salience(pitch_activation_mat, save_path=None,
                 alpha=1.0, label='detected F0'
             )
             plt.legend(loc='upper right')
-        plt.title('Pitch salience with detected F0 peaks')
+        title = 'Pitch salience with detected F0 peaks'
+    if model_name:
+        title += ' -- %s' % model_name
+    plt.title(title)
 
     if save_path is not None:
         plt.savefig(save_path)

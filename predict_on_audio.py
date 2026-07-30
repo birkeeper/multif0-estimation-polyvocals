@@ -118,6 +118,17 @@ def main(args):
         model.load_weights(model_path)
         thresh = 0.5
 
+    elif model_name == 'model3_adabn':
+
+        # model3's architecture with AdaBN-refined weights: BatchNorm recalibrated
+        # on synthetic SSATBB chords containing one attenuated voice, to reduce the
+        # "quiet voice -> low salience" bias. See models/exp3multif0_finetuned.md.
+        save_key = 'exp3multif0_finetuned_AdaBN'
+        model_path = "./models/{}.weights.h5".format(save_key)
+        model = models.build_model3()
+        model.load_weights(model_path)
+        thresh = 0.5
+
     elif model_name == 'model4':
 
         save_key = 'exp4multif0'
@@ -135,7 +146,9 @@ def main(args):
         thresh = 0.4
 
     else:
-        raise ValueError("Specified model must be model1, model2 or model3.")
+        raise ValueError(
+            "Specified model must be one of: model1, model2, model3, "
+            "model3_adabn, model4, model7.")
 
     # allow overriding the model's default global threshold from the CLI
     if args.thresh is not None:
@@ -150,7 +163,7 @@ def main(args):
     print("Model compiled")
 
     # select operation mode and compute prediction
-    if audiofile is not "0":
+    if audiofile != "0":
 
         if model_name == 'model7':
             # predict using trained model
@@ -168,26 +181,27 @@ def main(args):
 
         est_times, est_freqs = utils_train.pitch_activations_to_mf0(predicted_output, thresh)
 
+        stem = os.path.splitext(audiofile)[0]
+
         if plot_salience:
             utils_train.plot_salience(
-                predicted_output, audiofile.replace('.wav', '_salience.png'),
-                est_times, est_freqs
+                predicted_output, '{}_{}_salience.png'.format(stem, model_name),
+                est_times, est_freqs, model_name=model_name
             )
-
 
         # rearrange output
         for i, (tms, fqs) in enumerate(zip(est_times, est_freqs)):
             if any(fqs <= 0):
                 est_freqs[i] = np.array([f for f in fqs if f > 0])
 
-        output_path = audiofile.replace('wav', 'csv')
+        output_path = '{}_{}.csv'.format(stem, model_name)
         utils_train.save_multif0_output(est_times, est_freqs, output_path)
 
         print(" > > > Multiple F0 prediction for {} exported as {}.".format(
-            audiofile, audiofile.replace('wav', 'csv'))
+            audiofile, output_path)
         )
 
-    elif audio_folder is not "0":
+    elif audio_folder != "0":
 
         for audiofile in os.listdir(audio_folder):
 
@@ -212,13 +226,16 @@ def main(args):
 
             est_times, est_freqs = utils_train.pitch_activations_to_mf0(predicted_output, thresh)
 
+            stem = os.path.splitext(audiofile)[0]
+
             if plot_salience:
                 utils_train.plot_salience(
                     predicted_output,
                     save_path=os.path.join(
-                        audio_folder, audiofile.replace('.wav', '_salience.png'),
-                    est_times, est_freqs
-                    )
+                        audio_folder, '{}_{}_salience.png'.format(stem, model_name)
+                    ),
+                    est_times=est_times, est_freqs=est_freqs,
+                    model_name=model_name
                 )
 
             # rearrange output
@@ -227,14 +244,12 @@ def main(args):
                     est_freqs[i] = np.array([f for f in fqs if f > 0])
 
             output_path = os.path.join(
-                    audio_folder, audiofile.replace('wav', 'csv')
+                audio_folder, '{}_{}.csv'.format(stem, model_name)
             )
             utils_train.save_multif0_output(est_times, est_freqs, output_path)
 
             print(" > > > Multiple F0 prediction for {} exported as {}.".format(
-                audiofile, os.path.join(
-                    audio_folder, audiofile.replace('wav', 'csv')
-                ))
+                audiofile, output_path)
             )
     else:
         raise ValueError("One of audiofile and audio_folder must be specified.")
@@ -247,10 +262,12 @@ if __name__ == "__main__":
     parser.add_argument("--model",
                         dest='model_name',
                         type=str,
-                        help="Specify the ID of the model"
+                        help="Specify the ID of the model "
                              "to use for the prediction: model1 (Early/Deep) / "
                              "model2 (Early/Shallow) / "
-                             "model3 (Late/Deep, recommended)")
+                             "model3 (Late/Deep, recommended) / "
+                             "model3_adabn (model3 with AdaBN-refined weights, "
+                             "less biased against quiet voices in an ensemble)")
 
     parser.add_argument("--audiofile",
                         dest='audiofile',
