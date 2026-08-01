@@ -11,13 +11,28 @@ Method (see ../research/finetune_conversation.md):
     NOT offered. --strategy adapts where the loss actually happens:
       - bn   : AdaBN recalibration -- freeze all conv/dense weights, adapt only
                BatchNorm (gamma/beta + running stats recalibrate to the new
-               amplitude distribution). Cheapest; try first. Note BN pools its
-               statistics over the whole window, so a narrow quiet-voice sub-band
-               is diluted -- bn alone may be insufficient (hence full below).
-      - full : fine-tune all layers so the early harmonic detectors themselves
-               learn to keep a quiet voice above threshold. Pair with --l2sp to
-               anchor weights to their pretrained values (L2-SP, Xuhong et al.
-               2018) so normal-balance performance is not erased.
+               amplitude distribution). Cheapest, but see the warning below: it
+               adapts exactly the statistics that carry the domain shift.
+      - conv : the inverse, and the DEFAULT -- adapt the conv/dense weights so the
+               early harmonic detectors themselves learn to keep a quiet voice
+               above threshold, while BatchNorm is frozen (Keras holds a
+               trainable=False BN in inference mode, so gamma/beta and the running
+               statistics all stay put). The normalisation therefore remains
+               fitted to the real recordings model3 was trained on. Pair with
+               --l2sp to anchor the kernels to their pretrained values (L2-SP,
+               Xuhong et al. 2018) so normal-balance performance is not erased.
+      - full : everything at once. Note this does NOT avoid the drift below:
+               --l2sp anchors only variables named '*kernel*', and BatchNorm's
+               running statistics are not trainable variables at all, so nothing
+               anchors them.
+
+    WARNING -- the training data is synthetic and the target domain is real
+    recordings. Adapting BatchNorm recalibrates the model to the synthetic
+    amplitude distribution; on real audio the salience map is then compressed
+    downward (confident activations pulled down hardest), which destroys
+    detections while the synthetic validation still reports an improvement. This
+    happened: see models/exp3multif0_finetuned_AdaBN.md section 4. Use
+    --real_audio to watch for it, and prefer 'conv'.
   * --pos_weight upweights the loss on annotated (voice) time-frequency bins --
     "reweight near the soft voice's F0" -- countering the sparse-positive target
     so quiet-voice bins are not drowned by the empty background.
@@ -84,7 +99,7 @@ class Tee(object):
 
     def __init__(self, path):
         self.terminal = sys.stdout
-        self.log = open(path, 'a', buffering=1)
+        self.log = open(path, 'w', buffering=1)
 
     def write(self, s):
         self.terminal.write(s)
@@ -97,11 +112,18 @@ class Tee(object):
 
 
 def setup_logging(out_weights, args):
-    """Start teeing stdout to <out_weights minus .weights.h5>.log (appended, so
-    successive runs accumulate). Returns the log path."""
-    path = out_weights[:-len('.weights.h5')] + '.log'
+    """Start teeing stdout to a NEW log per run, next to the output weights and
+    stamped with the start time:
+
+        <out minus .weights.h5>_YYYYmmdd-HHMMSS.log
+
+    One file per run rather than one appended file, so runs can be compared
+    side by side and a re-run can never be mistaken for a continuation of the
+    previous one. Returns the log path."""
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    path = "%s_%s.log" % (out_weights[:-len('.weights.h5')], stamp)
     sys.stdout = Tee(path)
-    print("\n" + "=" * 78)
+    print("=" * 78)
     print("run started %s" % datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     print("args: %s" % json.dumps(vars(args), sort_keys=True))
     print("=" * 78)
@@ -266,8 +288,8 @@ def select_first_chords(win_files, n_chords):
 # Model
 # --------------------------------------------------------------------------
 def set_trainable(model, strategy):
-    """strategy in {'bn', 'full'}. 'head' is intentionally absent: a quiet voice
-    is lost before the head, so adapting only the head cannot recover it."""
+    """strategy in {'bn', 'conv', 'full'}. 'head' is intentionally absent: a quiet
+    voice is lost before the head, so adapting only the head cannot recover it."""
     if strategy == 'full':
         for layer in model.layers:
             layer.trainable = True
@@ -276,8 +298,24 @@ def set_trainable(model, strategy):
         # in training mode so its running stats recalibrate to the new amplitudes.
         for layer in model.layers:
             layer.trainable = isinstance(layer, tf.keras.layers.BatchNormalization)
+    elif strategy == 'conv':
+        # The inverse of 'bn': adapt the conv/dense weights, freeze BatchNorm.
+        #
+        # Keras special-cases BatchNormalization -- trainable=False also puts the
+        # layer in INFERENCE mode, even when the model is called with
+        # training=True -- so gamma/beta AND the running mean/variance are all
+        # held fixed. The normalisation therefore stays fitted to the real
+        # recordings model3 was trained on, instead of drifting to the synthetic
+        # amplitude distribution. That drift is what 'bn' does by design, and
+        # what 'full' also does incidentally: --l2sp anchors only variables whose
+        # name contains 'kernel', and the running statistics are not trainable
+        # variables at all, so nothing can anchor them.
+        #
+        # Pair with --l2sp, which does apply here, and verify with --real_audio.
+        for layer in model.layers:
+            layer.trainable = not isinstance(layer, tf.keras.layers.BatchNormalization)
     else:
-        raise ValueError("unknown strategy %r (use 'bn' or 'full')" % strategy)
+        raise ValueError("unknown strategy %r (use 'bn', 'conv' or 'full')" % strategy)
 
 
 def build_model(weights_path, strategy):
@@ -451,6 +489,52 @@ def evaluate_invariance(model, valid_dir, cache_dir, thresh, loss_fn, n_chords=N
                 loss_balanced=np.mean(lb), loss_victim=np.mean(lv))
 
 
+# --------------------------------------------------------------------------
+# Real-audio drift screen (no annotation required)
+# --------------------------------------------------------------------------
+# Training on synthetic audio can silently recalibrate the model to the
+# synthetic amplitude distribution. When that happens the salience map on REAL
+# audio is compressed downward -- confident activations pulled down hardest --
+# which destroys detections while the synthetic validation above still reports
+# an improvement. 
+#
+# Catching it needs no MIDI, no alignment, no tuning correction and no ground
+# truth: run the current weights over a few seconds of real audio and compare
+# the salience map with the one the PRE-TRAINED model produced for the same
+# file. Both come from the same audio, so they line up bin for bin.
+def drift_stats(base_sals, sals):
+    """Compare candidate salience maps against the pre-training ones, per real
+    excerpt, and average. Several short excerpts are much better than one long
+    one here: drift shows up as a consistent shift across independent material,
+    and a single file can mislead.
+
+    `real_rel_mean` is the overall level change. `real_d_high` is the change
+    where the baseline reads 0.80-0.90; if it is much more negative than the
+    overall mean change, the model is compressing its confident activations
+    downward -- the signature of having adapted to the synthetic distribution.
+    `real_worst` is the least favourable per-file mean change, so one bad
+    excerpt cannot be averaged away."""
+    per = []
+    for b, s in zip(base_sals, sals):
+        hi = (b >= 0.80) & (b < 0.90)
+        per.append((s.mean() / b.mean() - 1.0 if b.mean() else 0.0,
+                    float((s[hi] - b[hi]).mean()) if hi.sum() >= 50 else 0.0,
+                    float(np.corrcoef(b.ravel().astype(np.float64),
+                                      s.ravel().astype(np.float64))[0, 1])))
+    a = np.mean(per, axis=0)
+    return dict(real_rel_mean=float(a[0]), real_d_high=float(a[1]),
+                real_r=float(a[2]), real_worst=float(min(p[0] for p in per)),
+                real_n=len(per))
+
+
+def format_drift(m):
+    s = ("REAL(%d) mean %+.1f%%  d@high %+.3f  r=%.2f"
+         % (m['real_n'], 100 * m['real_rel_mean'], m['real_d_high'], m['real_r']))
+    if m['real_n'] > 1:
+        s += "  worst %+.1f%%" % (100 * m['real_worst'])
+    return s
+
+
 def format_metrics(m):
     return ("val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  "
             "prec bal=%.3f victim=%.3f  | quiet recall=%.3f gap=%.3f"
@@ -479,6 +563,13 @@ def guard_failures(inv, baseline, args):
     if inv['gap_quiet'] > baseline['gap_quiet'] + args.gap_tol:
         failed.append("gap_quiet %.3f>%.3f"
                       % (inv['gap_quiet'], baseline['gap_quiet'] + args.gap_tol))
+    # Real-audio drift: a synthetic win bought by wrecking the real-audio
+    # calibration is not a win. Only checked when --real_audio was given.
+    if 'real_rel_mean' in inv:
+        if inv['real_worst'] < -args.drift_tol:
+            failed.append("real mean %+.0f%%" % (100 * inv['real_worst']))
+        if inv['real_d_high'] < -args.drift_high_tol:
+            failed.append("real d@high %.3f" % inv['real_d_high'])
     return failed
 
 
@@ -528,6 +619,16 @@ def train(args):
         if args.TEST is not None:
             print("--TEST: validating on the first %d chord(s) of each file" % args.TEST)
 
+    # Real-audio drift screen: featurise once, up front. A few seconds is plenty
+    # -- this is a distribution check, not an accuracy measurement.
+    real_feat = []
+    for path in (args.real_audio or []):
+        path = os.path.expanduser(path)
+        rm, rd = featurize(pump, path)
+        real_feat.append((rm, rd))
+        print("Real-audio drift screen: %s (%d frames, %.1f s)"
+              % (os.path.basename(path), rm.shape[2], rm.shape[2] * 256.0 / 22050))
+
     model = build_model(args.weights, args.strategy)
     opt = tf.keras.optimizers.Adam(learning_rate=args.lr)
     loss_fn = make_bkld(args.pos_weight)
@@ -558,6 +659,11 @@ def train(args):
     if baseline is not None:
         print("baseline     | " + format_metrics(baseline))
 
+    # Pre-training salience on the real excerpt: the reference every epoch is
+    # compared against. Taken from the untouched weights, so it is the model's
+    # own real-audio behaviour before any synthetic data was seen.
+    base_real = [predict_salience(model, m, d) for m, d in real_feat]
+
     rng = np.random.RandomState(args.seed)
     bs = args.batch_size
     best_quiet = None
@@ -577,12 +683,29 @@ def train(args):
         print()
 
         msg = "epoch %d/%d  train_loss=%.4f" % (epoch + 1, args.epochs, float(np.mean(losses)))
+
+        # Keep every epoch so the checkpoint can be chosen AFTER the run, from
+        # real audio, instead of only by the synthetic in-loop metric. ~5 MB each.
+        if args.save_every_epoch:
+            ep_path = args.out[:-len('.weights.h5')] + '_e%02d.weights.h5' % (epoch + 1)
+            model.save_weights(ep_path)
+            msg += "  [-> %s]" % os.path.basename(ep_path)
+
+        drift = drift_stats(base_real,
+                            [predict_salience(model, m, d) for m, d in real_feat]) \
+            if base_real else {}
+        if drift:
+            print("  " + format_drift(drift))
+
         if args.valid_dir:
             inv = evaluate_invariance(model, args.valid_dir, valid_cache_dir, args.thresh,
                                       loss_fn, n_chords=args.TEST)
             if inv is not None:
+                inv.update(drift)
                 history.append(dict(epoch=epoch + 1, **inv))
                 msg += "  | " + format_metrics(inv)
+                if drift:
+                    msg += "  | " + format_drift(drift)
                 # Rank epochs on the UNDILUTED quiet-voice recall (the actual
                 # objective), and refuse any epoch that pays for it by regressing
                 # recall or precision on either side, or by widening the gap.
@@ -631,6 +754,14 @@ if __name__ == '__main__':
                         'one cache. Chords are randomly generated, so the first N are '
                         'representative.')
 
+    p.add_argument('--no_save_every_epoch', dest='save_every_epoch',
+                   action='store_false',
+                   help='by default every epoch is also written to '
+                        '<out>_eNN.weights.h5 (~5 MB each), so the checkpoint can be '
+                        'selected afterwards from real audio rather than only by the '
+                        'synthetic in-loop metric -- screen them with '
+                        'finetune/screen_checkpoints.py. This switch turns that off.')
+
     p.add_argument('--win', type=int, default=50, help='training window length (frames)')
     p.add_argument('--win_hop', type=int, default=None,
                    help='window stride in frames (default: --win, i.e. no overlap)')
@@ -642,9 +773,14 @@ if __name__ == '__main__':
     p.add_argument('--thresh', type=float, default=0.5, help='peak threshold for eval')
     p.add_argument('--seed', type=int, default=0)
 
-    p.add_argument('--strategy', choices=['bn', 'full'], default='full',
-                   help="which weights adapt: 'bn' = AdaBN recalibration only "
-                        "(cheap, try first); 'full' = all layers (pair with --l2sp)")
+    p.add_argument('--strategy', choices=['bn', 'conv', 'full'], default='conv',
+                   help="which weights adapt. 'conv' (default) = conv/dense weights, "
+                        "BatchNorm frozen -- the normalisation stays fitted to real "
+                        "audio, so it cannot drift to the synthetic distribution; "
+                        "pair with --l2sp. 'bn' = AdaBN recalibration only (cheap, "
+                        "but adapts exactly the statistics that cause that drift). "
+                        "'full' = everything, which drifts too since --l2sp cannot "
+                        "anchor BatchNorm's running statistics.")
     p.add_argument('--l2sp', type=float, default=1e-3,
                    help='L2-SP anchor strength for full fine-tuning (0 disables). '
                         'Penalises deviation of conv kernels from pretrained values.')
@@ -654,6 +790,26 @@ if __name__ == '__main__':
                    help='max allowed regression, vs the pre-training baseline, of '
                         'recall and precision on BOTH the balanced and victim sides '
                         'when selecting the best epoch')
+    p.add_argument('--real_audio', nargs='+', default=None, metavar='WAV',
+                   help='one or more REAL recordings (no annotation needed). Each '
+                        'epoch their salience maps are compared with the ones the '
+                        'pre-trained weights produced for the same files, catching '
+                        'the case where fine-tuning recalibrates the model to the '
+                        'synthetic distribution -- which the synthetic validation '
+                        'above cannot see. Several short excerpts beat one long one: '
+                        'a consistent shift across independent material is the '
+                        'signal. Check the line after epoch 1 and abort if the '
+                        'salience has already collapsed.')
+    p.add_argument('--drift_tol', type=float, default=0.10,
+                   help='reject an epoch if mean salience on the WORST --real_audio '
+                        'file falls more than this fraction below the pre-trained '
+                        'model (default 0.10 = 10%%). Worst rather than mean, so one '
+                        'bad excerpt cannot be averaged away.')
+    p.add_argument('--drift_high_tol', type=float, default=0.15,
+                   help='reject an epoch whose salience on --real_audio drops more '
+                        'than this where the pre-trained model reads 0.80-0.90, '
+                        'averaged over files. This is the signature of downward '
+                        'compression (default 0.15).')
     p.add_argument('--gap_tol', type=float, default=0.0,
                    help='max allowed widening of the undiluted quiet-voice gap '
                         '(recall_balanced - recall_quiet) vs baseline. 0 = the gap '
