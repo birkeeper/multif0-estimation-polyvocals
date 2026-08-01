@@ -232,17 +232,22 @@ unmasks the others.
 
 ---
 
-## 4. Evaluation on a real recording
+## 4. Evaluation on real recordings
 
 All of §3 is synthetic. This section is the check that matters: the same real
 audio processed by the base model and by this one.
 
-**Material.** "Kenny B – Parijs", a recorded SSATB ensemble (5 voices: Sopraan,
-Mezzo, Alt, Tenor, Bas), measures 1–2, ~4.8 s, four distinct chords. The score
-MIDI supplies the ground-truth pitch of every voice at every instant. The
-performance runs faster than the score tempo and the choir sings flat, so a
-linear time warp and a global tuning offset are fitted before scoring; both
-models receive identical treatment.
+**Material.** Two recorded ensembles, each scored against its own MIDI, which
+supplies the ground-truth pitch of every voice at every instant:
+
+| | voices | measures | duration | chords |
+|---|---|---|---|---|
+| *Kenny B – Parijs* | 5 (S, Mezzo, A, T, B) | 1–2 | 4.8 s | 4 |
+| *Late Night Talking* | 4 (S, Mezzo, T, B) | 1–4 | 7.8 s | 6 |
+
+Both performances run faster than their score tempo and both ensembles sing
+slightly flat, so a linear time warp and a cents-tolerance window are applied
+before scoring; both models receive identical treatment in every case.
 
 **Procedure.** Salience maps were saved for both models with
 `predict_on_audio.py --save_salience` and analysed with
@@ -251,32 +256,60 @@ the output CSVs matters here: every voice has a salience value at its known F0
 whether or not it crossed the detection threshold, so a "missed" voice is a low
 number rather than absent data, and no result depends on the threshold.
 
-### 4.1 The fine-tuned model uniformly suppresses salience
+### 4.1 The fine-tuned model compresses salience downward
 
-| | model3 | this model |
+This is the finding that reproduces cleanly on both recordings:
+
+| | mean salience | bins > 0.5 | map correlation | equivalent threshold |
+|---|---|---|---|---|
+| *Parijs* | 0.0240 → 0.0188 (**−22 %**) | 2807 → 1847 (−34 %) | r = 0.847 | 0.36 |
+| *Late Night Talking* | 0.0130 → 0.0104 (**−20 %**) | 2052 → 656 (−68 %) | r = 0.664 | 0.31 |
+
+"Equivalent threshold" is where this model becomes as selective as model3 is at
+0.50. **Any comparison at a shared threshold therefore compares two operating
+points, not two models.**
+
+The suppression is **not uniform — it grows steeply with activation level**, and
+much more steeply on the second recording:
+
+| model3 reads | Δ on *Parijs* | Δ on *Late Night Talking* |
 |---|---|---|
-| mean salience | 0.0240 | 0.0188 (−22 %) |
-| bins > 0.5 | 2807 | 1847 (−34 %) |
-| peaks at thr 0.5 | 1128 | 951 |
+| 0.05 – 0.10 | −0.016 | −0.016 |
+| 0.20 – 0.30 | −0.095 | −0.115 |
+| 0.40 – 0.50 | −0.160 | −0.241 |
+| 0.60 – 0.70 | −0.174 | −0.341 |
+| 0.80 – 0.90 | −0.261 | **−0.509** |
+| 0.90 – 1.00 | −0.126 | **−0.533** |
 
-The suppression grows with activation strength — about −0.05 where model3 reads
-0.15, about −0.27 where it reads 0.75 — so it is close to a monotonic
-rescaling. The two maps correlate at r = 0.847. Consequently **this model at
-threshold 0.36 sits at the same operating point as model3 at 0.50** (1132 vs
-1128 peaks).
+So this is a downward *compression* of the salience range, not a rescaling: the
+confident activations are pulled down several times harder than the weak ones.
+That has a consequence for §4.3 — compressing the top of the range narrows the
+relative spread between voices mechanically, whether or not any quiet voice was
+actually helped.
 
-### 4.2 Detection accuracy: no difference once the gain is corrected
+### 4.2 Detection accuracy
 
-| comparison | model3 | this model |
-|---|---|---|
-| at the default thr 0.5 | P 0.824 R 0.643 **F 0.722** | P 0.842 R 0.555 **F 0.669** |
-| at a matched detection count | **F 0.722** (thr 0.50) | **F 0.726** (thr 0.36) |
-| each at its own best threshold | **F 0.743** (thr 0.15) | **F 0.745** (thr 0.25) |
+All figures below come from `finetune/compare_voice_salience.py` (peak-picked,
+±80 cent match), so they are reproducible with a single command per recording.
 
-Compared fairly, the difference is +0.004 and +0.002 — noise. The salience map
-carries the same information as model3's; it is not better ordered, only scaled
-down. The apparent deficit at the default threshold is a calibration artifact,
-not a loss of accuracy.
+| | model3 | this model | Δ |
+|---|---|---|---|
+| ***Parijs***, at the default 0.50 | P 0.832 R 0.554 **F 0.665** | P 0.864 R 0.486 **F 0.622** | −0.043 |
+| *Parijs*, matched detection count | **F 0.665** @0.50 | **F 0.674** @0.36 | **+0.009** |
+| *Parijs*, each at its own best | **F 0.706** @0.15 | **F 0.693** @0.20 | −0.013 |
+| ***Late***, at the default 0.50 | P 0.889 R 0.296 **F 0.444** | P 0.862 R 0.146 **F 0.250** | −0.194 |
+| *Late*, matched detection count | **F 0.444** @0.50 | **F 0.414** @0.32 | **−0.030** |
+| *Late*, each at its own best | **F 0.545** @0.15 | **F 0.498** @0.15 | −0.047 |
+
+**At each model's own best threshold the fine-tuned model is worse on both
+recordings** (−0.013 and −0.047). At a matched detection count it is marginally
+better on *Parijs* (+0.009) and clearly worse on *Late Night Talking* (−0.030).
+The large deficits at the default 0.50 (−0.043, −0.194) are mostly calibration —
+the model is simply far more selective there — but correcting for that does not
+turn the comparison positive.
+
+Note also that **both models peak at 0.15**, the bottom of the swept range, on
+both recordings. The 0.5 default is badly mis-set for real audio.
 
 ### 4.3 Evenness across voices — the property actually targeted
 
@@ -284,7 +317,12 @@ Salience should indicate pitch *presence*, so the ideal output is uniformly high
 across all sounding voices regardless of how loudly each was sung. Per chord,
 relative to the loudest voice:
 
-| chord | spread, model3 | spread, this model | min/max, model3 | min/max, this model |
+(spread = max − min of the relative values, smaller is more even; min/max =
+quietest voice relative to loudest, larger is better.)
+
+**The two recordings disagree.**
+
+| *Parijs* chord | spread m3 | spread AdaBN | min/max m3 | min/max AdaBN |
 |---|---|---|---|---|
 | 1 | 0.63 | 0.66 | 0.37 | 0.34 |
 | 2 | 0.30 | 0.44 | 0.70 | 0.56 |
@@ -292,45 +330,95 @@ relative to the loudest voice:
 | 4 | 0.53 | **0.45** | 0.47 | **0.55** |
 | **mean** | **0.540** | 0.606 | **0.460** | 0.394 |
 
-(spread = max − min of the relative values, smaller is more even; min/max =
-quietest voice relative to loudest, larger is better.)
+| *Late Night Talking* chord | spread m3 | spread AdaBN | min/max m3 | min/max AdaBN |
+|---|---|---|---|---|
+| 1 | 0.70 | **0.65** | 0.30 | **0.35** |
+| 2 | 0.92 | **0.66** | 0.08 | **0.34** |
+| 3 | 0.20 | 0.71 | 0.80 | 0.29 |
+| 4 | 1.00 | **0.95** | 0.00 | 0.05 |
+| 5 | 1.00 | **0.99** | 0.00 | 0.01 |
+| 6 | 0.58 | **0.31** | 0.42 | **0.69** |
+| **mean** | 0.733 | **0.711** | 0.267 | **0.289** |
 
-**The voices become less even, not more.** The quiet voice is better held in
-only 1 of 4 chords. Chord 4 is a genuine local success — the bass A2 is the only
-voice anywhere in the excerpt whose *absolute* salience rises (0.386 → 0.422)
-despite the 22 % global suppression, and it gains relative too. But chord 3
-moves as hard the other way: the bass D3 collapses from 0.29 to 0.12, and the
-alto D4 from 0.86 to 0.57. Same register, same kind of voice, opposite
-direction.
+*Parijs* gets less even (spread +0.066, quiet voice better held in 1 of 4
+chords); *Late Night Talking* gets more even (spread −0.023, 5 of 6 chords).
+**Pooled over all 10 chords the effect vanishes**: mean spread 0.656 → 0.669 and
+mean min/max 0.344 → 0.331, both marginally against the fine-tuned model.
+
+Two qualifications on the *Late Night Talking* tally. Chords 4 and 5 count as
+"wins" only at the floor — the bass reads 0.000 → 0.015 and 0.001 → 0.002, i.e.
+both models fail on it completely and the difference is noise. Excluding those,
+the honest count across both recordings is roughly 4 clear wins, 2 clear losses,
+2 ties out of 10.
+
+**The per-chord swings dwarf the means.** Individual chords move between −0.51
+and +0.51 in spread, while the mean effect is ±0.02–0.07. Chord 2 of *Late Night
+Talking* is the single clearest instance of the intended behaviour anywhere:
+model3 essentially misses the bass C3 (0.029) and this model finds it (0.094,
+min/max 0.08 → 0.34). Chord 3 of the same piece is the clearest counterexample:
+tenor C4 0.382 → 0.086 and bass F3 0.442 → 0.109, spread 0.20 → 0.71.
+
+**A caution on reading the one favourable result.** *Late Night Talking* is both
+the recording where evenness improves and the recording where the downward
+compression is steepest (§4.1: −0.53 at the top of the range versus −0.13 on
+*Parijs*). Pulling loud bins down harder than quiet ones narrows the relative
+spread arithmetically, without any quiet voice being better represented — and
+indeed the same recording shows the *largest* detection loss (−0.030 matched,
+−0.047 at best threshold). A narrower spread bought by crushing the loud voices
+is not the improvement the fine-tuning was aiming at. Two of the six chords do
+show the bass gaining in *absolute* terms (chords 2 and 6), which compression
+alone cannot explain, so the effect is not purely artifact — but the
+compression has not been isolated from it, and the evenness numbers should not
+be read as a clean win.
 
 ### 4.4 Conclusion
 
-**The gain measured on synthetic data did not transfer to real audio.** On the
-synthetic matched pair this model gained +0.074 recall and +0.078 precision
-(§3); on real audio it gains nothing once the threshold is retuned, and the
-voice evenness it was built to improve gets worse on average. There is genuine
-per-voice redistribution happening — so the fine-tuning did learn *something*
-about low voices under masking — but on real recordings it fires more or less at
-random rather than on the quiet voice.
+**The synthetic gain did not transfer, and the fine-tuned model is not better on
+real audio.** On the synthetic matched pair it gained +0.074 recall and +0.078
+precision (§3). On real recordings:
 
-This is the domain-adaptation risk in §5 materialising: BatchNorm statistics
-were recalibrated onto soundfont renders, so on real voices the model is
-differently calibrated rather than improved.
+- **Detection accuracy is worse.** At each model's own best threshold, −0.013 on
+  *Parijs* and −0.047 on *Late Night Talking*. Matched by detection count, +0.009
+  and −0.030. No configuration makes it better on both.
+- **Voice evenness nets to nothing** — worse on *Parijs*, better on *Late Night
+  Talking*, pooled 0.656 → 0.669 spread across ten chords — and the one
+  favourable recording is also the one where the level compression that
+  mechanically narrows spread is steepest.
+- **What reproduces on both is the downward compression** of the salience range
+  (~20 % in the mean, up to −0.53 at the top on *Late Night Talking*).
 
-**Practical guidance.** There is no reason to prefer this model over model3 for
-real recordings. If it is used, set `--thresh 0.36` to match model3's default
-operating point. Separately and more usefully: **`--thresh 0.5` is too high for
-real audio in general** — model3 peaks at 0.15 on this excerpt (F 0.743 vs
-0.722, trading precision 0.824 → 0.732 for recall 0.643 → 0.756). That single
-flag buys more than the entire fine-tuning did.
+There *is* genuine per-voice redistribution — occasionally it lands exactly as
+intended, as with the bass C3 model3 misses entirely — so the fine-tuning did
+learn something about low voices under masking. But it is not reliable: on real
+recordings the between-chord variance is an order of magnitude larger than any
+mean benefit, and the sign flips between recordings.
 
-**Caveats.** One 4.8-second excerpt, four chords, one ensemble — chord 4's
-success is well within what chance can produce at n = 4. The alignment is the
-weakest link: the tempo fit lands at 22 % faster than the score with a
-score/salience correlation of only r = 0.509, though the conclusions are
-unchanged across the range of plausible warps tested. The per-voice readings use
-a ±80-cent window around each nominal pitch, which assumes the singers stay
-inside it.
+This is the domain-adaptation risk in §5 materialising: BatchNorm statistics were
+recalibrated onto soundfont renders, so on real voices the model is differently
+calibrated — and somewhat degraded — rather than improved.
+
+**Practical guidance.** Prefer model3 for real recordings. If this model is used
+anyway, its equivalent of model3's default is `--thresh 0.36` on *Parijs* and
+`0.31` on *Late Night Talking* — i.e. the right setting is material-dependent,
+which is itself a reason to avoid it.
+
+Separately and far more usefully: **`--thresh 0.5` is much too high for real
+audio.** Both models peak at 0.15 on both recordings — the bottom of the swept
+range, so the true optimum may be lower still. For model3 that is F 0.706 vs
+0.665 on *Parijs* and 0.545 vs 0.444 on *Late Night Talking*. **Lowering the
+threshold buys several times more than the entire fine-tuning did**, and costs
+nothing but a flag.
+
+**Caveats.** Ten chords across two short excerpts (4.8 s and 7.8 s) from two
+ensembles. That is enough to show the effect is *inconsistent* — the two
+recordings disagree in sign — but nowhere near enough to estimate its true size,
+and individual chord results are well within what chance produces at this n.
+Alignment is the weakest link: the tempo fits land 22 % and 15 % faster than
+their scores, with score/salience correlations of only r = 0.509 and r = 0.428.
+The *Parijs* conclusions were checked across the range of plausible warps and
+did not change. Per-voice readings use a ±80-cent window around each nominal
+pitch, which assumes the singers stay inside it — for chords where a voice reads
+near zero, an alignment or intonation error cannot be ruled out as the cause.
 
 ---
 

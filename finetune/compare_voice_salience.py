@@ -14,19 +14,36 @@ is not missing data; it is just a low number, and it widens the spread on its
 own. That side-steps the whole question of what to do with undetected voices,
 and makes the measure independent of the detection threshold.
 
-Per chord we report, for every voice:
-    * absolute salience
-    * salience relative to the loudest voice of that chord
-and summarise with
-    * spread    = max - min of the relative values  (smaller = voices more even)
-    * min/max   = quietest voice relative to loudest (larger = quiet voice better
-                  represented) -- this is the quantity a quiet-voice fine-tune
-                  is meant to improve.
+Two analyses are produced.
+
+1. WHOLE-MAP COMPARISON (no score, no alignment)
+   The models processed the same audio, so their maps line up bin for bin:
+   mean salience, bins above threshold, correlation with the baseline, and the
+   change as a function of the baseline's own activation level.
+
+   Read this first. If one model's salience is a scaled version of another's it
+   is not a different detector, only a differently calibrated one -- and any
+   later comparison at a shared threshold would be comparing two operating
+   points rather than two models. The reported 'equivalent thr' is the setting
+   at which each model is as selective as the baseline is at --thresh.
+
+2. PER-VOICE EVENNESS (needs the score)
+   Per chord, for every voice: absolute salience and salience relative to the
+   loudest voice of that chord, summarised by
+     * spread  = max - min of the relative values (smaller = voices more even)
+     * min/max = quietest voice relative to loudest (larger = quiet voice
+                 better held) -- the quantity a quiet-voice fine-tune targets.
+
+   Salience indicates pitch PRESENCE, so the ideal output is uniformly high
+   across every sounding voice however loudly each was actually sung; spread
+   near 0 is the target, whatever the ensemble balance.
 
 Two practical corrections are applied:
     * tempo  -- a live performance does not run at the MIDI tempo, so a linear
-                time warp (scale, offset) is fitted by maximising the salience
-                found at the expected F0s. Override with --scale / --offset.
+                time warp (scale, offset) is fitted by correlating the salience
+                against a mask built from the score. Override with --scale /
+                --offset; check the reported correlation, as a weak fit is the
+                usual reason a voice reads near zero.
     * tuning -- singers are not exactly at A440, so each voice is read as the
                 maximum within +-TOL cents of its nominal pitch (--tol).
 
@@ -34,10 +51,10 @@ Inputs are the .npz salience maps written by predict_on_audio.py --save_salience
 
 Example
 -------
-    python compare_voice_salience.py \
+    python finetune/compare_voice_salience.py \
         --salience model3=Parijs_model3_salience.npz \
                    adabn=Parijs_model3_adabn_salience.npz \
-        --midi "Kenny B - Parijs.mid" --measures 1-2 --bpm 90
+        --midi "Kenny B - Parijs.mid" --measures 1-2
 """
 
 from __future__ import print_function
@@ -217,6 +234,151 @@ def score_mask(chords, fgrid, tgrid, scale, offset, tol_cents):
     return m
 
 
+def report_suppression(models, base, thresh):
+    """Whole-map comparison against the baseline. Needs no score and no
+    alignment: the models processed the same audio, so their maps line up bin
+    for bin.
+
+    This matters before any accuracy comparison. If one model's salience is
+    simply a scaled version of another's, it is not a different detector, only a
+    differently calibrated one -- and comparing them at a shared threshold then
+    compares two operating points rather than two models. The 'equivalent thr'
+    column is the threshold at which each model becomes as selective as the
+    baseline is at `thresh`."""
+    names = list(models)
+    S = {n: models[n][0] for n in names}
+    ref_count = int((S[base] > thresh).sum())
+
+    print("\n" + "=" * 62)
+    print("WHOLE-MAP COMPARISON vs %s  (no score or alignment involved)" % base)
+    print("  %-10s %9s %11s %8s %12s"
+          % ('model', 'mean', 'bins>%.2f' % thresh, 'r vs base', 'equiv thr'))
+    for n in names:
+        r = np.corrcoef(S[base].ravel().astype(np.float64),
+                        S[n].ravel().astype(np.float64))[0, 1]
+        if n == base:
+            eq = '%.2f' % thresh
+        else:
+            grid = np.arange(0.02, 1.00, 0.01)
+            counts = np.array([(S[n] > t).sum() for t in grid])
+            eq = '%.2f' % grid[int(np.argmin(np.abs(counts - ref_count)))]
+        rel = '' if n == base else ' (%+.0f%%)' % (100 * (S[n].mean() / S[base].mean() - 1))
+        print("  %-10s %9.4f %11d %8.3f %12s%s"
+              % (n, S[n].mean(), (S[n] > thresh).sum(), r, eq, rel))
+
+    others = [n for n in names if n != base]
+    if not others:
+        return
+    print("\n  Change as a function of the baseline's own activation level.")
+    print("  A constant column is a pure rescaling; a column that varies with")
+    print("  level means the models genuinely rank time-frequency bins differently.")
+    edges = [0.0, .05, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.001]
+    print("  %-14s %9s" % ('baseline bin', 'n bins')
+          + "".join(" %12s" % ('d ' + n) for n in others))
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (S[base] >= lo) & (S[base] < hi)
+        if m.sum() < 50:
+            continue
+        print("  %.2f - %-8.2f %9d" % (lo, hi, m.sum())
+              + "".join(" %+12.4f" % (S[n][m] - S[base][m]).mean() for n in others))
+
+
+def peak_pick(sal, fgrid, thresh):
+    """Per frame, the frequencies of local maxima along the frequency axis that
+    exceed `thresh`. Replicates utils_train.pitch_activations_to_mf0 -- importing
+    it would pull in TensorFlow, matplotlib and pandas for three lines of scipy --
+    so results match what predict_on_audio.py writes to CSV."""
+    import scipy.signal
+    m = np.zeros(sal.shape, dtype=sal.dtype)
+    pk = scipy.signal.argrelmax(sal, axis=0)
+    m[pk] = sal[pk]
+    fi, ti = np.where(m >= thresh)
+    out = [[] for _ in range(sal.shape[1])]
+    for f, t in zip(fi, ti):
+        out[t].append(float(fgrid[f]))
+    return out
+
+
+def frame_ground_truth(chords, tgrid, scale, offset):
+    """Distinct sounding frequencies per audio frame. Unisons collapse to one
+    entry: a multi-F0 estimate cannot represent two voices on the same pitch, so
+    counting them twice would charge the model for an impossible miss."""
+    gt = [[] for _ in range(len(tgrid))]
+    for t0, t1, voices in chords:
+        k = np.where((tgrid >= scale * t0 + offset) & (tgrid <= scale * t1 + offset))[0]
+        fs = sorted({round(hz(p), 4) for _v, p in voices})
+        for i in k:
+            gt[i] = fs
+    return gt
+
+
+def detection_scores(est, gt, tol_cents):
+    """Precision / recall / F of a peak-picked estimate against the score."""
+    tp = fp = fn = 0
+    for got, ref in zip(est, gt):
+        used = []
+        for a in ref:
+            hit = [g for g in got if g not in used
+                   and abs(1200 * np.log2(g / a)) <= tol_cents]
+            if hit:
+                used.append(hit[0]); tp += 1
+            else:
+                fn += 1
+        fp += len(got) - len(used)
+    p = tp / (tp + fp) if tp + fp else 0.0
+    r = tp / (tp + fn) if tp + fn else 0.0
+    return p, r, (2 * p * r / (p + r) if p + r else 0.0)
+
+
+def report_detection(models, chords, scale, offset, tol_cents, thresh, base):
+    """Accuracy against the score, swept over thresholds.
+
+    Swept rather than reported at one setting because §the whole-map comparison
+    may already have shown the models sit at different operating points; a
+    single shared threshold would then measure calibration, not accuracy. The
+    matched-count row is the fair head-to-head."""
+    names = list(models)
+    fgrid, tgrid = models[base][1], models[base][2]
+    gt = frame_ground_truth(chords, tgrid, scale, offset)
+    n_gt = sum(len(x) for x in gt)
+    if not n_gt:
+        print("\n(detection accuracy skipped: the score covers none of the audio)")
+        return
+
+    grid = np.arange(0.15, 0.81, 0.05)
+    picked = {n: {t: peak_pick(models[n][0], fgrid, t) for t in grid} for n in names}
+    res = {n: {t: detection_scores(picked[n][t], gt, tol_cents) for t in grid}
+           for n in names}
+
+    print("\n" + "=" * 62)
+    print("DETECTION ACCURACY vs the score  (peak-picked, +-%.0fc match, %d "
+          "reference pitches)" % (tol_cents, n_gt))
+    print("  %-5s" % 'thr' + "".join(" | %-21s" % n for n in names))
+    print("  %-5s" % '' + "".join(" |     P      R      F " for _ in names))
+    for t in grid:
+        print("  %.2f " % t
+              + "".join(" | %.3f  %.3f  %.3f" % res[n][t] for n in names))
+    print("  %-5s" % 'best'
+          + "".join(" | %.3f @thr %.2f    " % (max(res[n][t][2] for t in grid),
+                    max(grid, key=lambda t: res[n][t][2])) for n in names))
+
+    # fair head-to-head: same number of detections
+    ref_n = sum(len(f) for f in peak_pick(models[base][0], fgrid, thresh))
+    print("\n  Matched operating point -- each model at the threshold giving the")
+    print("  same number of detections as %s at %.2f (%d peaks):" % (base, thresh, ref_n))
+    for n in names:
+        if n == base:
+            eq = thresh
+        else:
+            fine = np.arange(0.05, 0.95, 0.01)
+            counts = [sum(len(f) for f in peak_pick(models[n][0], fgrid, t)) for t in fine]
+            eq = float(fine[int(np.argmin(np.abs(np.array(counts) - ref_n)))])
+        est = peak_pick(models[n][0], fgrid, eq)
+        p, r, f1 = detection_scores(est, gt, tol_cents)
+        print("    %-10s @%.2f  P=%.3f R=%.3f F=%.3f  (%d peaks)"
+              % (n, eq, p, r, f1, sum(len(x) for x in est)))
+
+
 def fit_warp(models, chords, tol_cents, scales, offsets):
     """Choose (scale, offset) by correlating the salience map with a mask built
     from the score. Correlation -- unlike the mean salience under the mask --
@@ -259,6 +421,13 @@ def main(args):
               % (name, os.path.basename(path), models[name][0].shape,
                  models[name][2][-1]))
 
+    shapes = {models[n][0].shape for n in models}
+    if len(shapes) == 1:
+        report_suppression(models, list(models)[0], args.thresh)
+    else:
+        print("\n(whole-map comparison skipped: maps differ in shape %s -- they are "
+              "not from the same audio)" % sorted(shapes))
+
     m_from, m_to = (int(x) for x in args.measures.split('-')) \
         if '-' in args.measures else (int(args.measures), int(args.measures))
     chords, dur = read_score(args.midi, m_from, m_to, args.bpm)
@@ -278,6 +447,11 @@ def main(args):
               % (scale, offset, (1.0 / scale - 1) * 100, q))
 
     names = list(models)
+    if not args.no_detection:
+        report_detection(models, chords, scale, offset, args.tol, args.thresh, names[0])
+
+    print("\n" + "=" * 62)
+    print("PER-VOICE EVENNESS")
     summary = {n: [] for n in names}
 
     for ci, (t0, t1, voices) in enumerate(chords, 1):
@@ -349,6 +523,13 @@ if __name__ == '__main__':
                    help='cents window around each nominal pitch, absorbing choir '
                         'tuning. Keep below half the smallest interval in the '
                         'chords (default 80).')
+    p.add_argument('--thresh', type=float, default=0.5,
+                   help='reference threshold for the whole-map comparison: bins are '
+                        'counted above it, and each model\'s equivalent threshold is '
+                        'the one making it as selective as the baseline here '
+                        '(default 0.5, the models\' own default)')
+    p.add_argument('--no_detection', action='store_true',
+                   help='skip the detection-accuracy sweep (the slowest part)')
     p.add_argument('--scale', type=float, default=None,
                    help='fix the tempo warp instead of fitting it')
     p.add_argument('--offset', type=float, default=0.0,
