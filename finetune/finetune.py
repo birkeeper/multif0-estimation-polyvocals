@@ -44,7 +44,7 @@ Method (see ../research/finetune_conversation.md):
     `distribution` layer's (360,1) kernel makes its backprop-filter memory scale
     with T (a whole chord OOMs; ~50 frames keeps it ~1.6 GB). Windowing within
     chords also skips the inter-chord silence.
-  * Epoch selection VALIDATES BOTH SIDES on the matched pair (balanced vs.
+  * Checkpoint selection VALIDATES BOTH SIDES on the matched pair (balanced vs.
     one-voice-quiet). Because all 6 voices sound in every chord and only one is
     attenuated, the raw victim recall is diluted 6x; selection therefore ranks
     epochs on the UNDILUTED quiet-voice recall
@@ -52,7 +52,9 @@ Method (see ../research/finetune_conversation.md):
     guarded so the win is not bought elsewhere: recall and precision on both
     sides must not regress past --bal_tol vs. the pre-training baseline, and the
     quiet-voice gap must not widen past --gap_tol. Small LR, few epochs.
-  * Progress and per-epoch results are teed to <out>.log, so a long run's
+    This runs at every epoch boundary and, with --eval_every, part-way through
+    an epoch as well -- the interesting movement is over well inside epoch 1.
+  * Progress and per-checkpoint results are teed to <out>.log, so a long run's
     numbers survive the terminal.
 
 Layout expected (from generate_chords.py + PWA render):
@@ -666,30 +668,27 @@ def train(args):
 
     rng = np.random.RandomState(args.seed)
     bs = args.batch_size
-    best_quiet = None
+    state = dict(best_quiet=None)
     history = []
-    for epoch in range(args.epochs):
-        order = rng.permutation(len(win_files))
-        losses = []
-        n_batches = (len(order) + bs - 1) // bs
-        for bi, b in enumerate(range(0, len(order), bs)):
-            batch = [np.load(win_files[i]) for i in order[b:b+bs]]
-            x1 = tf.convert_to_tensor(np.stack([d['mag'] for d in batch]), tf.float32)
-            x2 = tf.convert_to_tensor(np.stack([d['dph'] for d in batch]), tf.float32)
-            y = tf.convert_to_tensor(np.stack([d['tgt'] for d in batch]), tf.float32)
-            losses.append(float(train_step(x1, x2, y)))
-            print("\r  batch %d/%d  loss=%.4f" % (bi + 1, n_batches, losses[-1]),
-                  end='', flush=True)
-        print()
 
-        msg = "epoch %d/%d  train_loss=%.4f" % (epoch + 1, args.epochs, float(np.mean(losses)))
+    def assess(tag, label):
+        """Checkpoint + evaluate + guard the CURRENT weights, and update the
+        best-so-far. Called at the end of every epoch and, when --eval_every is
+        set, part-way through one as well.
 
-        # Keep every epoch so the checkpoint can be chosen AFTER the run, from
-        # real audio, instead of only by the synthetic in-loop metric. ~5 MB each.
+        Sub-epoch evaluation exists because the useful movement and the
+        real-audio drift do not happen on the same timescale: both recorded runs
+        show the synthetic metrics converged and the salience already collapsed
+        by the end of epoch 1, so epoch granularity cannot show where the two
+        separate. `tag` names the checkpoint file, `label` opens the log line."""
+        msg = label
+
+        # Keep every checkpoint so it can be chosen AFTER the run, from real
+        # audio, instead of only by the synthetic in-loop metric. ~5 MB each.
         if args.save_every_epoch:
-            ep_path = args.out[:-len('.weights.h5')] + '_e%02d.weights.h5' % (epoch + 1)
-            model.save_weights(ep_path)
-            msg += "  [-> %s]" % os.path.basename(ep_path)
+            ck_path = args.out[:-len('.weights.h5')] + '_%s.weights.h5' % tag
+            model.save_weights(ck_path)
+            msg += "  [-> %s]" % os.path.basename(ck_path)
 
         drift = drift_stats(base_real,
                             [predict_salience(model, m, d) for m, d in real_feat]) \
@@ -702,23 +701,54 @@ def train(args):
                                       loss_fn, n_chords=args.TEST)
             if inv is not None:
                 inv.update(drift)
-                history.append(dict(epoch=epoch + 1, **inv))
+                history.append(dict(tag=tag, **inv))
                 msg += "  | " + format_metrics(inv)
                 if drift:
                     msg += "  | " + format_drift(drift)
-                # Rank epochs on the UNDILUTED quiet-voice recall (the actual
-                # objective), and refuse any epoch that pays for it by regressing
+                # Rank checkpoints on the UNDILUTED quiet-voice recall (the actual
+                # objective), and refuse any that pays for it by regressing
                 # recall or precision on either side, or by widening the gap.
                 failed = guard_failures(inv, baseline, args)
                 if failed:
                     msg += "  [rejected: %s]" % ", ".join(failed)
-                elif best_quiet is None or inv['recall_quiet'] > best_quiet:
-                    best_quiet = inv['recall_quiet']
+                elif state['best_quiet'] is None or inv['recall_quiet'] > state['best_quiet']:
+                    state['best_quiet'] = inv['recall_quiet']
                     model.save_weights(args.out)
                     msg += "  [saved best]"
         else:
             model.save_weights(args.out)
         print(msg)
+
+    step = 0
+    for epoch in range(args.epochs):
+        order = rng.permutation(len(win_files))
+        losses = []
+        since_eval = []
+        n_batches = (len(order) + bs - 1) // bs
+        for bi, b in enumerate(range(0, len(order), bs)):
+            batch = [np.load(win_files[i]) for i in order[b:b+bs]]
+            x1 = tf.convert_to_tensor(np.stack([d['mag'] for d in batch]), tf.float32)
+            x2 = tf.convert_to_tensor(np.stack([d['dph'] for d in batch]), tf.float32)
+            y = tf.convert_to_tensor(np.stack([d['tgt'] for d in batch]), tf.float32)
+            losses.append(float(train_step(x1, x2, y)))
+            since_eval.append(losses[-1])
+            step += 1
+            print("\r  batch %d/%d  loss=%.4f" % (bi + 1, n_batches, losses[-1]),
+                  end='', flush=True)
+            # Mid-epoch checkpoint. Skipped on the final batch of an epoch,
+            # where it would duplicate the end-of-epoch one below.
+            if args.eval_every and step % args.eval_every == 0 and bi + 1 < n_batches:
+                print()
+                assess('e%02d_s%06d' % (epoch + 1, step),
+                       "  step %d (epoch %d, batch %d/%d)  train_loss=%.4f"
+                       % (step, epoch + 1, bi + 1, n_batches, float(np.mean(since_eval))))
+                since_eval = []
+        print()
+
+        assess('e%02d' % (epoch + 1),
+               "epoch %d/%d  train_loss=%.4f"
+               % (epoch + 1, args.epochs, float(np.mean(losses))))
+    best_quiet = state['best_quiet']
 
     if not args.valid_dir:
         print("Saved final weights to %s" % args.out)
@@ -731,9 +761,10 @@ def train(args):
               % args.out)
 
     if history:
-        print("\nepoch summary")
+        print("\ncheckpoint summary")
+        w = max(len(h['tag']) for h in history)
         for h in history:
-            print("  %2d | %s" % (h['epoch'], format_metrics(h)))
+            print("  %-*s | %s" % (w, h['tag'], format_metrics(h)))
 
 
 if __name__ == '__main__':
@@ -756,11 +787,21 @@ if __name__ == '__main__':
 
     p.add_argument('--no_save_every_epoch', dest='save_every_epoch',
                    action='store_false',
-                   help='by default every epoch is also written to '
-                        '<out>_eNN.weights.h5 (~5 MB each), so the checkpoint can be '
+                   help='by default every checkpoint is also written to '
+                        '<out>_eNN[_sNNNNNN].weights.h5 (~5 MB each), so it can be '
                         'selected afterwards from real audio rather than only by the '
                         'synthetic in-loop metric -- screen them with '
                         'finetune/screen_checkpoints.py. This switch turns that off.')
+    p.add_argument('--eval_every', type=int, default=0, metavar='STEPS',
+                   help='also checkpoint, validate and guard every STEPS optimizer '
+                        'steps within an epoch (0 = at epoch boundaries only). Both '
+                        'recorded runs converged on the synthetic metrics AND lost '
+                        '~36%% of their real-audio salience inside epoch 1, so epoch '
+                        'granularity cannot show where the quiet-voice gain and the '
+                        'drift separate. Each evaluation costs a full pass over the '
+                        'validation pair plus the --real_audio excerpts, so set this '
+                        'to a fraction of an epoch (e.g. 1/10th of the batch count), '
+                        'not to a handful of steps.')
 
     p.add_argument('--win', type=int, default=50, help='training window length (frames)')
     p.add_argument('--win_hop', type=int, default=None,
