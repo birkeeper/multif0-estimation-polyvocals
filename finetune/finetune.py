@@ -668,7 +668,14 @@ def train(args):
 
     rng = np.random.RandomState(args.seed)
     bs = args.batch_size
-    state = dict(best_quiet=None)
+    # Seed the ranking with the PRE-TRAINING quiet-voice recall, so a checkpoint
+    # has to beat the base model to be saved -- not merely survive the guards.
+    # The guards are tolerances (--bal_tol etc.), so a checkpoint slightly worse
+    # than baseline on the objective still passes them; starting from None meant
+    # the first such checkpoint was written to --out unconditionally and the run
+    # could ship a model worse than the one it started from.
+    state = dict(best_quiet=baseline['recall_quiet'] if baseline else None,
+                 saved=None)
     history = []
 
     def assess(tag, label):
@@ -712,9 +719,13 @@ def train(args):
                 if failed:
                     msg += "  [rejected: %s]" % ", ".join(failed)
                 elif state['best_quiet'] is None or inv['recall_quiet'] > state['best_quiet']:
+                    improved = (baseline is None or
+                                inv['recall_quiet'] - baseline['recall_quiet'])
                     state['best_quiet'] = inv['recall_quiet']
+                    state['saved'] = tag
                     model.save_weights(args.out)
-                    msg += "  [saved best]"
+                    msg += ("  [saved best%s]" % ('' if baseline is None
+                                                  else ', %+.3f vs baseline' % improved))
         else:
             model.save_weights(args.out)
         print(msg)
@@ -748,17 +759,21 @@ def train(args):
         assess('e%02d' % (epoch + 1),
                "epoch %d/%d  train_loss=%.4f"
                % (epoch + 1, args.epochs, float(np.mean(losses))))
-    best_quiet = state['best_quiet']
-
     if not args.valid_dir:
         print("Saved final weights to %s" % args.out)
-    elif best_quiet is None:
-        model.save_weights(args.out)
-        print("No epoch improved quiet-voice recall within the guards; "
-              "saved final-epoch weights to %s" % args.out)
+    elif state['saved'] is None:
+        # Deliberately do NOT fall back to the final-epoch weights: nothing beat
+        # the pre-trained model on the objective, so writing anything to --out
+        # would ship a regression under a name that implies an improvement. The
+        # per-checkpoint files are still on disk if the run is worth salvaging.
+        print("No checkpoint beat the baseline quiet-voice recall (%.3f) within "
+              "the guards; %s NOT written -- use %s instead."
+              % (state['best_quiet'], args.out, os.path.basename(args.weights)))
     else:
-        print("Best (highest quiet-voice recall, guards satisfied) weights saved to %s"
-              % args.out)
+        print("Best (highest quiet-voice recall, guards satisfied) weights saved "
+              "to %s -- from %s, quiet recall %.3f vs baseline %.3f"
+              % (args.out, state['saved'], state['best_quiet'],
+                 baseline['recall_quiet']))
 
     if history:
         print("\ncheckpoint summary")
