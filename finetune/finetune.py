@@ -33,6 +33,17 @@ Method (see ../research/finetune_conversation.md):
     detections while the synthetic validation still reports an improvement. This
     happened: see models/exp3multif0_finetuned_AdaBN.md section 4. Use
     --real_audio to watch for it, and prefer 'conv'.
+  * --distill_dir adds a SECOND loss term on real, unannotated audio: the
+    pre-trained model is run over it once and the student is penalised for moving
+    away from that output. Every strategy above changed the real-audio
+    CALIBRATION rather than the separation -- -36% (conv), -22% (bn), +55% (bn
+    with pos_weight 4) -- because the loss only ever saw soundfont renders, so
+    recalibrating to them was the cheapest way to reduce it. This term is the
+    same quantity drift_stats() already reports, moved out of the accept/reject
+    decision and into the gradient. It is --l2sp measured on OUTPUTS instead of
+    weights, which is both the quantity that matters and the only one that works
+    under --strategy bn (no variable is named 'kernel' there, so --l2sp anchors
+    nothing). Must be disjoint from --real_audio, which stays held out.
   * --pos_weight upweights the loss on annotated (voice) time-frequency bins --
     "reweight near the soft voice's F0" -- countering the sparse-positive target
     so quiet-voice bins are not drowned by the empty background.
@@ -88,6 +99,20 @@ tf.config.threading.set_intra_op_parallelism_threads(0)
 tf.config.threading.set_inter_op_parallelism_threads(0)
 
 CHUNK_LEN = 2000          # time frames per model.predict call (for eval)
+
+# Audio containers the distillation pool accepts. librosa.load() goes through
+# soundfile/libsndfile, which resamples to 22050 and downmixes to mono for all
+# of these. MP3 is deliberately absent: soundfile 0.9 does not support it and
+# librosa's audioread fallback is deprecated -- transcode to FLAC first.
+AUDIO_EXT = ('*.wav', '*.flac', '*.ogg')
+
+# Frames to drop from each end of a window before comparing student and teacher.
+# The teacher salience is computed whole-file (no boundary artifacts), but the
+# student sees a --win-frame window that is zero-padded at both ends, so its
+# output near the edges cannot match. Summing the time receptive field:
+# conv1..conv4 (5,5) = +-2 each, harm1/harm2 (70,3) = +-1 each, conv7/conv8
+# (3,3) = +-1 each, distribution (360,1) = 0  ->  about +-12 frames.
+DISTILL_EDGE_CROP = 12
 
 
 # --------------------------------------------------------------------------
@@ -348,6 +373,44 @@ def make_bkld(pos_weight=1.0):
     return loss
 
 
+def make_distill_loss(gamma=0.0, crop=DISTILL_EDGE_CROP):
+    """Real-audio anchor: how far the student's salience has moved from the
+    teacher's on the same audio.
+
+    SYMMETRIC by design. An earlier reading of the runs suggested penalising only
+    downward deviation, since the failure always looked like compression -- but
+    pos_weight=4 then produced +55% INFLATION, so the failure mode is calibration
+    drift in either direction and a one-sided penalty would let half of it through.
+
+    `gamma` weights the penalty by the teacher's own confidence, t**gamma:
+      gamma=0  uniform -- pin everything equally. Also pins the quiet voices the
+               teacher misses, which is exactly what we want to change, so this is
+               the conservative baseline, not the ideal.
+      gamma>0  pin hard where the teacher reads high, weakly where it reads near
+               zero: "keep what you already know, stay free where you were
+               unsure". Lets a quiet voice rise without licensing a general
+               inflation of the background.
+
+    Both variants are normalised by the mean weight, so the term's scale (and
+    hence a given --distill_lambda) does not shift when gamma changes."""
+    eps = 1e-7
+    g = float(gamma)
+
+    def loss(t_true, y_pred):
+        if crop:
+            t_true = t_true[:, :, crop:-crop]
+            y_pred = y_pred[:, :, crop:-crop]
+        t = tf.clip_by_value(t_true, eps, 1.0 - eps)
+        p = tf.clip_by_value(y_pred, eps, 1.0 - eps)
+        per = -(t * tf.math.log(p) + (1.0 - t) * tf.math.log(1.0 - p))
+        if g > 0.0:
+            w = tf.pow(t, g)
+            return tf.reduce_sum(w * per) / (tf.reduce_sum(w) + eps)
+        return tf.reduce_mean(per)
+
+    return loss
+
+
 def predict_salience(model, mag, dph):
     """Full (F, T) salience for (H, F, T) inputs, chunked over time."""
     x1 = np.transpose(mag, (1, 2, 0))[np.newaxis]   # (1, F, T, H)
@@ -400,6 +463,187 @@ def prepare_valid(pump, valid_dir, cache_dir, recompute=False):
         print("  cached %s (%d frames)" % (stem, mag.shape[2]))
     open(done_marker, 'w').close()
     print("Cached features for %d validation files in %s" % (len(wav_files), cache_dir))
+
+
+# --------------------------------------------------------------------------
+# Distillation pool: real audio, no annotation.
+#
+# Every run so far changed the model's real-audio CALIBRATION rather than its
+# ability to separate voices: -36% (conv), -22% (bn, pos_weight 1), -8% (bn at
+# lr 1e-5) and +55% (bn, pos_weight 4). Different strategies and learning rates,
+# opposite signs, one cause -- the loss is measured only on soundfont renders, so
+# recalibrating to them is the cheapest way to reduce it, and nothing opposes it.
+#
+# The fix is a second loss term on real audio. There is no annotation, but none
+# is needed: the target is what the PRE-TRAINED model itself predicts for that
+# audio, so the term says "do not change here". That is the same reference
+# `drift_stats()` already compares against every checkpoint -- this moves it from
+# the accept/reject decision into the gradient, where the optimiser can steer
+# around the failure instead of stumbling into it and being rejected.
+#
+# Equivalently: --l2sp anchors WEIGHTS to their pretrained values; this anchors
+# OUTPUTS on the input distribution that actually matters. Weight-space distance
+# is a poor proxy (and under --strategy bn it anchors nothing at all -- no
+# variable is named 'kernel', hence the "L2-SP anchoring 0 kernels" in the log).
+# --------------------------------------------------------------------------
+_QUIET_MAX = 0.10         # teacher peak below this -> window counts as 'quiet'
+
+# <stem>_w<NNNN>[_q].npz -- stems may contain spaces and underscores, so anchor
+# on the _wNNNN suffix rather than splitting on '_'.
+_WIN_RE = re.compile(r'^(.*)_w\d{4}(?:_q)?\.npz$')
+
+
+def list_audio(d):
+    """All accepted audio containers in a directory (see AUDIO_EXT)."""
+    out = []
+    for ext in AUDIO_EXT:
+        out.extend(glob.glob(os.path.join(d, ext)))
+    return sorted(out)
+
+
+def audio_stem(path):
+    return os.path.basename(path).rsplit('.', 1)[0]
+
+
+def _file_sig(path):
+    st = os.stat(path)
+    return [st.st_size, int(st.st_mtime)]
+
+
+def _cache_stamp(weights, win, hop):
+    """Identity of the cached teacher targets. The targets are only valid for the
+    weights that produced them, so a cache built from different --weights must be
+    rebuilt rather than silently reused."""
+    st = os.stat(weights)
+    return dict(weights=os.path.abspath(weights), size=st.st_size,
+                mtime=int(st.st_mtime), win=win, hop=hop)
+
+
+def prepare_distill(pump, model, weights, distill_dir, cache_dir, win=50, hop=None,
+                    recompute=False, exclude=()):
+    """Featurize each real recording, run the CURRENT (still pre-trained) model
+    over it whole-file to get the teacher salience, and cache one npz per window
+    holding mag/dph/tsal.
+
+    Called before training starts, so `model` still holds the untouched weights
+    -- the same trick `base_real` uses. No second model is ever in memory: the
+    teacher is frozen by definition, so its outputs are computed once and become
+    just another cached target array alongside mag/dph.
+
+    The teacher runs on the WHOLE file and is sliced afterwards, so its targets
+    carry no window-boundary artifacts (see DISTILL_EDGE_CROP).
+
+    Windows whose teacher peak is below _QUIET_MAX are tagged '_q' in the
+    filename so their share can be capped at load time without reading the npz --
+    same filename-encoding trick prepare() uses for chord indices. They are kept
+    rather than dropped: a window whose correct answer is "stay near zero" is the
+    cheapest available constraint against the upward inflation that pos_weight=4
+    produced.
+
+    `exclude` is the set of --real_audio stems. Overlap is a hard error: training
+    on the drift-screen files would turn the only held-out signal in the log into
+    a training metric."""
+    hop = hop or win
+    if win <= 2 * DISTILL_EDGE_CROP:
+        raise SystemExit(
+            "--win %d leaves nothing to distill on: %d frames are cropped from "
+            "each end (receptive field), so --win must exceed %d."
+            % (win, DISTILL_EDGE_CROP, 2 * DISTILL_EDGE_CROP))
+    os.makedirs(cache_dir, exist_ok=True)
+    stamp_path = os.path.join(cache_dir, 'DONE')
+    stamp = _cache_stamp(weights, win, hop)
+
+    files = list_audio(distill_dir)
+    if not files:
+        raise SystemExit(
+            "--distill_dir %s contains no audio (looked for %s). Put the real "
+            "recordings there, or drop --distill_dir to train without the "
+            "real-audio anchor." % (distill_dir, ', '.join(AUDIO_EXT)))
+
+    # Overlap check. Exact-basename equality is NOT enough: a guard excerpt is
+    # typically CUT from a longer take, so the pool holds 'late.flac' while the
+    # screen holds 'late_dada.wav' -- different names, same audio. Training on the
+    # parent recording silently turns the drift screen into a training metric,
+    # which reports near-zero drift by construction. Comparing stems as prefixes
+    # catches that naming pattern; it cannot detect an unrelated filename holding
+    # the same audio, so the per-file lines printed below are also there to be
+    # audited.
+    def stem(p):
+        return os.path.basename(p).rsplit('.', 1)[0].lower()
+
+    clash = sorted({"%s <-> %s" % (os.path.basename(f), os.path.basename(e))
+                    for f in files for e in exclude
+                    if stem(f) == stem(e) or stem(f).startswith(stem(e))
+                    or stem(e).startswith(stem(f))})
+    if clash:
+        raise SystemExit(
+            "--distill_dir and --real_audio overlap: %s\n"
+            "The --real_audio excerpts are the HELD-OUT drift screen. If the pool "
+            "contains that audio (or the longer take it was cut from), the REAL(n) "
+            "line stops being a measurement -- the model is trained to preserve "
+            "exactly what is then used to check preservation. Move the file out of "
+            "the pool. If the names merely look alike and the audio is unrelated, "
+            "rename to something that does not share a prefix."
+            % '; '.join(clash))
+
+    if os.path.exists(stamp_path) and not recompute:
+        try:
+            old = json.load(open(stamp_path))
+        except ValueError:
+            old = None
+        if old == stamp:
+            print("Using cached distillation targets in %s" % cache_dir)
+            return
+        print("Distillation cache was built from different settings "
+              "(%s) -- rebuilding." % ('weights/window changed' if old else 'no stamp'))
+
+    for p in glob.glob(os.path.join(cache_dir, '*.npz')):
+        os.remove(p)
+
+    n_win = n_quiet = 0
+    for path in files:
+        mag, dph = featurize(pump, path)              # (H, F, T)
+        tsal = predict_salience(model, mag, dph)      # (F, T), teacher, whole-file
+        stem = os.path.basename(path).rsplit('.', 1)[0]
+        T = mag.shape[2]
+        fw = 0
+        for w, s in enumerate(range(0, T - win + 1, hop)):
+            tseg = tsal[:, s:s+win]
+            quiet = float(tseg.max()) < _QUIET_MAX
+            np.savez_compressed(
+                os.path.join(cache_dir, '%s_w%04d%s.npz'
+                             % (stem, w, '_q' if quiet else '')),
+                mag=np.transpose(mag[:, :, s:s+win], (1, 2, 0)),
+                dph=np.transpose(dph[:, :, s:s+win], (1, 2, 0)),
+                tsal=tseg)
+            fw += 1
+            n_win += 1
+            n_quiet += quiet
+        print("  %s -> %d frames (%.1f s), %d windows%s"
+              % (stem, T, T * 256.0 / 22050, fw,
+                 '  ! shorter than --win, contributes nothing' if fw == 0 else ''))
+    json.dump(stamp, open(stamp_path, 'w'))
+    print("Cached %d distillation windows (%d quiet) from %d files, win=%d hop=%d."
+          % (n_win, n_quiet, len(files), win, hop))
+
+
+def load_distill_windows(cache_dir, quiet_cap=0.33, rng=None):
+    """Cached window paths, with the share of 'quiet' windows (tagged '_q' by
+    prepare_distill) capped at `quiet_cap` of the pool. Quiet windows are
+    valuable but must not crowd out windows containing actual singing."""
+    wins = sorted(glob.glob(os.path.join(cache_dir, '*.npz')))
+    quiet = [p for p in wins if '_q.npz' in p]
+    loud = [p for p in wins if '_q.npz' not in p]
+    if not loud or quiet_cap >= 1.0:
+        return wins
+    # keep at most quiet_cap of the final pool
+    allowed = int(quiet_cap * len(loud) / max(1e-9, 1.0 - quiet_cap))
+    if len(quiet) > allowed:
+        idx = (rng or np.random.RandomState(0)).permutation(len(quiet))[:allowed]
+        quiet = [quiet[i] for i in sorted(idx)]
+        print("  capped quiet windows to %d (%.0f%% of pool)"
+              % (len(quiet), 100.0 * len(quiet) / (len(quiet) + len(loud))))
+    return sorted(loud + quiet)
 
 
 # --------------------------------------------------------------------------
@@ -537,6 +781,17 @@ def format_drift(m):
     return s
 
 
+def format_train_loss(pairs, distilling):
+    """Mean (synthetic, distillation) training loss over a list of per-step pairs.
+    The two terms are reported SEPARATELY, never summed: the whole point is to
+    watch the trade-off between fitting the synthetic chords and holding the
+    real-audio calibration, and a single total hides it."""
+    a = np.mean(pairs, axis=0)
+    if not distilling:
+        return "train_loss=%.4f" % a[0]
+    return "train_loss=%.4f distill=%.4f" % (a[0], a[1])
+
+
 def format_metrics(m):
     return ("val_loss bal=%.4f victim=%.4f  recall bal=%.3f victim=%.3f  GAP=%.3f  "
             "prec bal=%.3f victim=%.3f  | quiet recall=%.3f gap=%.3f"
@@ -634,6 +889,10 @@ def train(args):
     model = build_model(args.weights, args.strategy)
     opt = tf.keras.optimizers.Adam(learning_rate=args.lr)
     loss_fn = make_bkld(args.pos_weight)
+    # pos_weight is deliberately NOT applied to the anchor: its 'y_true > 0.5'
+    # test would upweight bins wherever the TEACHER happened to be confident,
+    # which is unrelated to the annotated-voice reweighting it exists for.
+    distill_fn = make_distill_loss(args.distill_gamma)
 
     # L2-SP: snapshot pretrained conv/dense kernels so we can penalise deviation
     # from them (anchors 'full' fine-tuning against forgetting).
@@ -644,16 +903,27 @@ def train(args):
         print("L2-SP anchoring %d kernels (lambda=%g)" % (len(anchors), args.l2sp))
 
     @tf.function
-    def train_step(x1, x2, y):
+    def train_step(x1, x2, y, rx1=None, rx2=None, rt=None):
         with tf.GradientTape() as tape:
-            pred = model([x1, x2], training=True)
-            loss = loss_fn(y, pred)
+            loss_s = loss_fn(y, model([x1, x2], training=True))
+            loss = loss_s
+            loss_r = tf.constant(0.0)
+            if rx1 is not None:
+                # Separate forward pass, NOT one concatenated batch: BatchNorm in
+                # training mode normalises by batch statistics, and a mixed
+                # synthetic/real batch would give a blended statistic matching
+                # neither domain. Under --strategy bn this second pass is doing
+                # double duty -- it also puts real audio into the running-mean/
+                # variance updates, which is what stops them converging onto the
+                # soundfont distribution in the first place.
+                loss_r = distill_fn(rt, model([rx1, rx2], training=True))
+                loss = loss + args.distill_lambda * loss_r
             if anchors:
                 loss = loss + args.l2sp * tf.add_n(
                     [tf.reduce_sum(tf.square(v - v0)) for v, v0 in anchors])
         grads = tape.gradient(loss, model.trainable_variables)
         opt.apply_gradients(zip(grads, model.trainable_variables))
-        return loss
+        return loss_s, loss_r
 
     # Pre-training baseline so we can require the other metrics not to regress.
     baseline = evaluate_invariance(model, args.valid_dir, valid_cache_dir, args.thresh,
@@ -666,7 +936,50 @@ def train(args):
     # own real-audio behaviour before any synthetic data was seen.
     base_real = [predict_salience(model, m, d) for m, d in real_feat]
 
+    # Distillation pool. Built HERE, after the baseline and base_real and before
+    # the first optimizer step, so `model` still holds the pretrained weights and
+    # can act as its own teacher -- no second copy in memory.
     rng = np.random.RandomState(args.seed)
+    distill_files, next_real = [], None
+    if args.distill_dir:
+        distill_cache = os.path.join(args.distill_dir, '_cache')
+        prepare_distill(pump, model, args.weights, args.distill_dir, distill_cache,
+                        win=args.win, hop=args.win_hop, recompute=args.recompute,
+                        exclude=[os.path.expanduser(p) for p in (args.real_audio or [])])
+        # Its OWN RandomState, deliberately not `rng`. If the distillation pool
+        # drew from the same generator it would shift every subsequent synthetic
+        # epoch shuffle, so a --distill_lambda 0 ablation would not see the same
+        # synthetic ordering as a --distill_lambda 1 run and the comparison would
+        # be confounded by data order.
+        drng = np.random.RandomState(args.seed + 1)
+        distill_files = load_distill_windows(distill_cache, args.distill_quiet_cap, drng)
+        if not distill_files:
+            raise SystemExit("Distillation cache is empty: %s" % distill_cache)
+        print("Distilling on %d real windows (%.1f min), lambda=%g gamma=%g, "
+              "edge crop %d frames"
+              % (len(distill_files), len(distill_files) * args.win * 256.0 / 22050 / 60,
+                 args.distill_lambda, args.distill_gamma, DISTILL_EDGE_CROP))
+
+        def make_cycler(files, batch, r):
+            """Draw `batch` window paths per call, reshuffling when the pool is
+            exhausted. The real pool is cycled independently of the synthetic one,
+            so the two need not be the same size; epoch length stays defined by
+            the synthetic set."""
+            order, pos = [list(r.permutation(len(files)))], [0]
+
+            def nxt():
+                out = []
+                while len(out) < batch:
+                    if pos[0] >= len(order[0]):
+                        order[0] = list(r.permutation(len(files)))
+                        pos[0] = 0
+                    out.append(files[order[0][pos[0]]])
+                    pos[0] += 1
+                return out
+            return nxt
+
+        next_real = make_cycler(distill_files, args.batch_size, drng)
+
     bs = args.batch_size
     # Seed the ranking with the PRE-TRAINING quiet-voice recall, so a checkpoint
     # has to beat the base model to be saved -- not merely survive the guards.
@@ -741,24 +1054,37 @@ def train(args):
             x1 = tf.convert_to_tensor(np.stack([d['mag'] for d in batch]), tf.float32)
             x2 = tf.convert_to_tensor(np.stack([d['dph'] for d in batch]), tf.float32)
             y = tf.convert_to_tensor(np.stack([d['tgt'] for d in batch]), tf.float32)
-            losses.append(float(train_step(x1, x2, y)))
+            if next_real is not None:
+                rb = [np.load(p) for p in next_real()]
+                ls, lr = train_step(
+                    x1, x2, y,
+                    tf.convert_to_tensor(np.stack([d['mag'] for d in rb]), tf.float32),
+                    tf.convert_to_tensor(np.stack([d['dph'] for d in rb]), tf.float32),
+                    tf.convert_to_tensor(np.stack([d['tsal'] for d in rb]), tf.float32))
+            else:
+                ls, lr = train_step(x1, x2, y)
+            losses.append((float(ls), float(lr)))
             since_eval.append(losses[-1])
             step += 1
-            print("\r  batch %d/%d  loss=%.4f" % (bi + 1, n_batches, losses[-1]),
+            print("\r  batch %d/%d  loss=%.4f%s"
+                  % (bi + 1, n_batches, losses[-1][0],
+                     '  distill=%.4f' % losses[-1][1] if next_real else ''),
                   end='', flush=True)
             # Mid-epoch checkpoint. Skipped on the final batch of an epoch,
             # where it would duplicate the end-of-epoch one below.
             if args.eval_every and step % args.eval_every == 0 and bi + 1 < n_batches:
                 print()
                 assess('e%02d_s%06d' % (epoch + 1, step),
-                       "  step %d (epoch %d, batch %d/%d)  train_loss=%.4f"
-                       % (step, epoch + 1, bi + 1, n_batches, float(np.mean(since_eval))))
+                       "  step %d (epoch %d, batch %d/%d)  %s"
+                       % (step, epoch + 1, bi + 1, n_batches,
+                          format_train_loss(since_eval, next_real is not None)))
                 since_eval = []
         print()
 
         assess('e%02d' % (epoch + 1),
-               "epoch %d/%d  train_loss=%.4f"
-               % (epoch + 1, args.epochs, float(np.mean(losses))))
+               "epoch %d/%d  %s"
+               % (epoch + 1, args.epochs,
+                  format_train_loss(losses, next_real is not None)))
     if not args.valid_dir:
         print("Saved final weights to %s" % args.out)
     elif state['saved'] is None:
@@ -840,6 +1166,37 @@ if __name__ == '__main__':
     p.add_argument('--l2sp', type=float, default=1e-3,
                    help='L2-SP anchor strength for full fine-tuning (0 disables). '
                         'Penalises deviation of conv kernels from pretrained values.')
+    p.add_argument('--distill_dir', default=None, metavar='DIR',
+                   help='directory of REAL recordings (%s), no annotation needed, '
+                        'used as a second loss term: the pre-trained model is run '
+                        'over them once and the student is penalised for moving '
+                        'away from its output. This is --l2sp measured on OUTPUTS '
+                        'instead of weights, and it is the same quantity the '
+                        'REAL(n) drift line reports -- moved from the accept/reject '
+                        'decision into the gradient. Must be DISJOINT from '
+                        '--real_audio, which stays the held-out screen. Diversity '
+                        'matters more than duration: 8 recordings x 3 min beats one '
+                        '25 min file.' % ', '.join(e[1:] for e in AUDIO_EXT))
+    p.add_argument('--distill_lambda', type=float, default=1.0,
+                   help='weight of the real-audio anchor relative to the synthetic '
+                        'loss (default 1.0; 0 disables the term but STILL passes '
+                        'real audio through the network, which under --strategy bn '
+                        'alone stops the BatchNorm running statistics converging '
+                        'onto the synthetic distribution -- a useful ablation)')
+    p.add_argument('--distill_gamma', type=float, default=0.0,
+                   help='confidence-weight the anchor by teacher_salience**gamma. '
+                        '0 (default) = uniform, which also pins the quiet voices '
+                        'the teacher misses. >0 pins hard where the teacher is '
+                        'confident and leaves the student free where it read near '
+                        'zero: "keep what you know, stay free where you were '
+                        'unsure". Try 1.0 once a uniform run has given a baseline.')
+    p.add_argument('--distill_quiet_cap', type=float, default=0.33,
+                   help='max share of the distillation pool made up of near-silent '
+                        'windows (teacher peak < %.2f). These are kept rather than '
+                        'dropped -- a window whose correct answer is "stay near '
+                        'zero" is the cheapest constraint against upward salience '
+                        'inflation -- but must not crowd out actual singing.'
+                        % _QUIET_MAX)
     p.add_argument('--pos_weight', type=float, default=1.0,
                    help='loss upweight on annotated (voice) target bins (1.0 = off)')
     p.add_argument('--bal_tol', type=float, default=0.03,

@@ -1,0 +1,16 @@
+==============================================================================
+run started 2026-08-04 21:43:19
+args: {"TEST": 1, "bal_tol": 0.03, "batch_size": 10, "distill_dir": "./finetune/data/distill", "distill_gamma": 0.0, "distill_lambda": 1.0, "distill_quiet_cap": 0.33, "drift_high_tol": 0.15, "drift_tol": 0.1, "epochs": 6, "eval_every": 66, "gap_tol": 0.0, "l2sp": 0.001, "lr": 0.0001, "out": "./models/exp3multif0_finetuned_bn_distill_bn_TEST.weights.h5", "pos_weight": 1.0, "real_audio": ["./finetune/data/valid/late_dada.wav", "./finetune/data/valid/Parijs_dedetdoe.wav"], "recompute": false, "save_every_epoch": true, "seed": 0, "strategy": "bn", "thresh": 0.5, "train_dir": "./finetune/data/train/", "valid_dir": "./finetune/data/valid/", "weights": "./models/exp3multif0.h5", "win": 50, "win_hop": null}
+==============================================================================
+Output weights: ./models/exp3multif0_finetuned_bn_distill_bn_TEST.weights.h5
+--TEST run: output marked TEST -- not a usable model
+Logging to ./models/exp3multif0_finetuned_bn_distill_bn_TEST_20260804-214319.log
+Using 6650 cached windows in ./finetune/data/train/_cache
+--TEST: first 1 chord(s) per file -> 55 of 6650 windows
+Using cached features for 2 validation files in ./finetune/data/valid/_cache
+--TEST: validating on the first 1 chord(s) of each file
+Real-audio drift screen: late_dada.wav (671 frames, 7.8 s)
+Real-audio drift screen: Parijs_dedetdoe.wav (416 frames, 4.8 s)
+Strategy 'bn': 17 trainable layers (17 layers)
+L2-SP anchoring 0 kernels (lambda=0.001)
+baseline     | val_loss bal=0.0635 victim=0.0664  recall bal=0.784 victim=0.773  GAP=0.011  prec bal=0.922 victim=0.920  | quiet recall=0.716 gap=0.067

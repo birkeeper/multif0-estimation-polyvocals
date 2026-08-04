@@ -14,3 +14,56 @@ baseline     | val_loss bal=0.1149 victim=0.1284  recall bal=0.809 victim=0.783 
 
   REAL(2) mean +4.5%  d@high -0.009  r=0.99  worst +4.2%
   step 66 (epoch 1, batch 66/665)  train_loss=0.1482  [-> exp3multif0_finetuned_bn_e01_s000066.weights.h5]  | val_loss bal=0.1128 victim=0.1260  recall bal=0.811 victim=0.784  GAP=0.027  prec bal=0.875 victim=0.875  | quiet recall=0.650 gap=0.161  | REAL(2) mean +4.5%  d@high -0.009  r=0.99  worst +4.2%  [saved best]
+
+  REAL(2) mean +10.2%  d@high -0.010  r=0.98  worst +9.4%
+  step 132 (epoch 1, batch 132/665)  train_loss=0.1477  [-> exp3multif0_finetuned_bn_e01_s000132.weights.h5]  | val_loss bal=0.1111 victim=0.1241  recall bal=0.818 victim=0.790  GAP=0.028  prec bal=0.868 victim=0.868  | quiet recall=0.648 gap=0.170  | REAL(2) mean +10.2%  d@high -0.010  r=0.98  worst +9.4%  [rejected: gap_quiet 0.170>0.161]
+
+  REAL(2) mean +16.7%  d@high -0.005  r=0.97  worst +15.0%
+  step 198 (epoch 1, batch 198/665)  train_loss=0.1451  [-> exp3multif0_finetuned_bn_e01_s000198.weights.h5]  | val_loss bal=0.1098 victim=0.1224  recall bal=0.825 victim=0.796  GAP=0.029  prec bal=0.859 victim=0.859  | quiet recall=0.652 gap=0.173  | REAL(2) mean +16.7%  d@high -0.005  r=0.97  worst +15.0%  [rejected: gap_quiet 0.173>0.161]
+
+  REAL(2) mean +23.1%  d@high +0.000  r=0.97  worst +20.3%
+  step 264 (epoch 1, batch 264/665)  train_loss=0.1360  [-> exp3multif0_finetuned_bn_e01_s000264.weights.h5]  | val_loss bal=0.1083 victim=0.1206  recall bal=0.831 victim=0.802  GAP=0.029  prec bal=0.851 victim=0.851  | quiet recall=0.657 gap=0.174  | REAL(2) mean +23.1%  d@high +0.000  r=0.97  worst +20.3%  [rejected: gap_quiet 0.174>0.161]
+
+  REAL(2) mean +27.3%  d@high +0.003  r=0.96  worst +23.8%
+  step 330 (epoch 1, batch 330/665)  train_loss=0.1386  [-> exp3multif0_finetuned_bn_e01_s000330.weights.h5]  | val_loss bal=0.1073 victim=0.1193  recall bal=0.836 victim=0.807  GAP=0.029  prec bal=0.845 victim=0.844  | quiet recall=0.662 gap=0.174  | REAL(2) mean +27.3%  d@high +0.003  r=0.96  worst +23.8%  [rejected: precision_balanced 0.845<0.848, precision_victim 0.844<0.848, gap_quiet 0.174>0.161]
+
+  REAL(2) mean +32.2%  d@high +0.006  r=0.96  worst +27.6%
+  step 396 (epoch 1, batch 396/665)  train_loss=0.1362  [-> exp3multif0_finetuned_bn_e01_s000396.weights.h5]  | val_loss bal=0.1056 victim=0.1171  recall bal=0.842 victim=0.813  GAP=0.029  prec bal=0.840 victim=0.838  | quiet recall=0.667 gap=0.175  | REAL(2) mean +32.2%  d@high +0.006  r=0.96  worst +27.6%  [rejected: precision_balanced 0.840<0.848, precision_victim 0.838<0.848, gap_quiet 0.175>0.161]
+
+  REAL(2) mean +35.8%  d@high +0.009  r=0.95  worst +30.2%
+  step 462 (epoch 1, batch 462/665)  train_loss=0.1352  [-> exp3multif0_finetuned_bn_e01_s000462.weights.h5]  | val_loss bal=0.1044 victim=0.1157  recall bal=0.846 victim=0.817  GAP=0.029  prec bal=0.836 victim=0.834  | quiet recall=0.671 gap=0.175  | REAL(2) mean +35.8%  d@high +0.009  r=0.95  worst +30.2%  [rejected: precision_balanced 0.836<0.848, precision_victim 0.834<0.848, gap_quiet 0.175>0.161]
+
+  REAL(2) mean +39.9%  d@high +0.010  r=0.95  worst +33.4%
+  step 528 (epoch 1, batch 528/665)  train_loss=0.1401  [-> exp3multif0_finetuned_bn_e01_s000528.weights.h5]  | val_loss bal=0.1032 victim=0.1142  recall bal=0.851 victim=0.821  GAP=0.029  prec bal=0.831 victim=0.828  | quiet recall=0.676 gap=0.175  | REAL(2) mean +39.9%  d@high +0.010  r=0.95  worst +33.4%  [rejected: precision_balanced 0.831<0.848, precision_victim 0.828<0.848, gap_quiet 0.175>0.161]
+
+  REAL(2) mean +42.3%  d@high +0.008  r=0.95  worst +34.8%
+  step 594 (epoch 1, batch 594/665)  train_loss=0.1344  [-> exp3multif0_finetuned_bn_e01_s000594.weights.h5]  | val_loss bal=0.1021 victim=0.1128  recall bal=0.854 victim=0.825  GAP=0.029  prec bal=0.827 victim=0.824  | quiet recall=0.680 gap=0.174  | REAL(2) mean +42.3%  d@high +0.008  r=0.95  worst +34.8%  [rejected: precision_balanced 0.827<0.848, precision_victim 0.824<0.848, gap_quiet 0.174>0.161]
+
+  REAL(2) mean +45.0%  d@high +0.008  r=0.94  worst +36.2%
+  step 660 (epoch 1, batch 660/665)  train_loss=0.1335  [-> exp3multif0_finetuned_bn_e01_s000660.weights.h5]  | val_loss bal=0.1013 victim=0.1117  recall bal=0.856 victim=0.827  GAP=0.029  prec bal=0.825 victim=0.822  | quiet recall=0.684 gap=0.172  | REAL(2) mean +45.0%  d@high +0.008  r=0.94  worst +36.2%  [rejected: precision_balanced 0.825<0.848, precision_victim 0.822<0.848, gap_quiet 0.172>0.161]
+
+  REAL(2) mean +45.1%  d@high +0.007  r=0.94  worst +36.2%
+epoch 1/6  train_loss=0.1394  [-> exp3multif0_finetuned_bn_e01.weights.h5]  | val_loss bal=0.1013 victim=0.1117  recall bal=0.856 victim=0.828  GAP=0.029  prec bal=0.825 victim=0.822  | quiet recall=0.684 gap=0.172  | REAL(2) mean +45.1%  d@high +0.007  r=0.94  worst +36.2%  [rejected: precision_balanced 0.825<0.848, precision_victim 0.822<0.848, gap_quiet 0.172>0.161]
+
+  REAL(2) mean +45.3%  d@high +0.004  r=0.94  worst +36.1%
+  step 726 (epoch 2, batch 61/665)  train_loss=0.1239  [-> exp3multif0_finetuned_bn_e02_s000726.weights.h5]  | val_loss bal=0.1006 victim=0.1109  recall bal=0.858 victim=0.829  GAP=0.029  prec bal=0.824 victim=0.821  | quiet recall=0.685 gap=0.172  | REAL(2) mean +45.3%  d@high +0.004  r=0.94  worst +36.1%  [rejected: precision_balanced 0.824<0.848, precision_victim 0.821<0.848, gap_quiet 0.172>0.161]
+
+  REAL(2) mean +47.1%  d@high +0.002  r=0.93  worst +37.2%
+  step 792 (epoch 2, batch 127/665)  train_loss=0.1242  [-> exp3multif0_finetuned_bn_e02_s000792.weights.h5]  | val_loss bal=0.0998 victim=0.1099  recall bal=0.860 victim=0.831  GAP=0.029  prec bal=0.822 victim=0.819  | quiet recall=0.686 gap=0.174  | REAL(2) mean +47.1%  d@high +0.002  r=0.93  worst +37.2%  [rejected: precision_balanced 0.822<0.848, precision_victim 0.819<0.848, gap_quiet 0.174>0.161]
+
+  REAL(2) mean +49.4%  d@high +0.001  r=0.93  worst +38.6%
+  step 858 (epoch 2, batch 193/665)  train_loss=0.1271  [-> exp3multif0_finetuned_bn_e02_s000858.weights.h5]  | val_loss bal=0.0991 victim=0.1088  recall bal=0.862 victim=0.834  GAP=0.028  prec bal=0.820 victim=0.817  | quiet recall=0.692 gap=0.170  | REAL(2) mean +49.4%  d@high +0.001  r=0.93  worst +38.6%  [rejected: precision_balanced 0.820<0.848, precision_victim 0.817<0.848, gap_quiet 0.170>0.161]
+
+  REAL(2) mean +51.6%  d@high -0.003  r=0.93  worst +39.8%
+  step 924 (epoch 2, batch 259/665)  train_loss=0.1230  [-> exp3multif0_finetuned_bn_e02_s000924.weights.h5]  | val_loss bal=0.0982 victim=0.1077  recall bal=0.864 victim=0.836  GAP=0.028  prec bal=0.818 victim=0.815  | quiet recall=0.695 gap=0.169  | REAL(2) mean +51.6%  d@high -0.003  r=0.93  worst +39.8%  [rejected: precision_balanced 0.818<0.848, precision_victim 0.815<0.848, gap_quiet 0.169>0.161]
+
+  REAL(2) mean +53.4%  d@high -0.005  r=0.92  worst +40.7%
+  step 990 (epoch 2, batch 325/665)  train_loss=0.1254  [-> exp3multif0_finetuned_bn_e02_s000990.weights.h5]  | val_loss bal=0.0976 victim=0.1070  recall bal=0.866 victim=0.838  GAP=0.028  prec bal=0.816 victim=0.812  | quiet recall=0.698 gap=0.169  | REAL(2) mean +53.4%  d@high -0.005  r=0.92  worst +40.7%  [rejected: precision_balanced 0.816<0.848, precision_victim 0.812<0.848, gap_quiet 0.169>0.161]
+
+  REAL(2) mean +55.3%  d@high -0.006  r=0.92  worst +41.8%
+  step 1056 (epoch 2, batch 391/665)  train_loss=0.1232  [-> exp3multif0_finetuned_bn_e02_s001056.weights.h5]  | val_loss bal=0.0970 victim=0.1061  recall bal=0.868 victim=0.840  GAP=0.028  prec bal=0.815 victim=0.811  | quiet recall=0.700 gap=0.168  | REAL(2) mean +55.3%  d@high -0.006  r=0.92  worst +41.8%  [rejected: precision_balanced 0.815<0.848, precision_victim 0.811<0.848, gap_quiet 0.168>0.161]
+
+  REAL(2) mean +56.2%  d@high -0.009  r=0.92  worst +42.0%
+  step 1122 (epoch 2, batch 457/665)  train_loss=0.1242  [-> exp3multif0_finetuned_bn_e02_s001122.weights.h5]  | val_loss bal=0.0965 victim=0.1056  recall bal=0.869 victim=0.841  GAP=0.028  prec bal=0.814 victim=0.811  | quiet recall=0.701 gap=0.168  | REAL(2) mean +56.2%  d@high -0.009  r=0.92  worst +42.0%  [rejected: precision_balanced 0.814<0.848, precision_victim 0.811<0.848, gap_quiet 0.168>0.161]
+
+  REAL(2) mean +59.2%  d@high -0.009  r=0.91  worst +43.5%
