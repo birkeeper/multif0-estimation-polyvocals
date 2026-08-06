@@ -19,6 +19,8 @@ real recordings**.
 | Anchor data | 7 real a cappella recordings, 26.4 min, unannotated (§2.3) |
 | Date produced | 2026-08-05 |
 | Log | `models/exp3multif0_finetuned_distill_conv_20260805-182553.log` |
+| Status | candidate validated on two guard excerpts — calibration preserved (`r ≈ 0.996`), detection accuracy not harmed, **+0.025 to +0.031 voice evenness across all 4 excerpt × checkpoint cells** (§4.3.7). Untested on any recording free of selection contact |
+| Recommended checkpoint | `e01` or `e02` — indistinguishable on real audio (§4.3.5); **not** the `e02_s001122` currently in `--out` (§3.5) |
 
 > **Note on the filename.** `train()` appends the strategy to `--out`, so the
 > `_conv` suffix is generated, not typed. **This model is `--strategy conv`** — no
@@ -397,13 +399,19 @@ nothing prevents the rule from selecting a noise peak.
 **The honest headline figure is quiet recall ≈ 0.765, +0.117 over baseline**, and
 `e01`/`e02` are the checkpoints worth carrying forward.
 
+> **Confirmed on real audio (§4.3.5).** `e01` and `e02` were later compared
+> directly on a real excerpt and are indistinguishable — `r = 0.999`, every
+> detection and evenness metric within 0.004. The 460 optimizer steps separating
+> them changed nothing measurable, which is what a plateau predicts.
+
 ---
 
 ## 4. Behaviour on real recordings
 
-**The real-audio evaluation that decides whether this model is useful has not been
-performed.** §3 is entirely soundfont renders scored at a threshold of 0.5. This
-section documents only what the run itself measured.
+§3 is entirely soundfont renders scored at a threshold of 0.5. §4.1–4.2 document
+what the run itself measured (a distribution check). §4.3 reports the real-audio
+accuracy and evenness evaluation, which has now been performed **on one excerpt**;
+§4.4 states what remains.
 
 ### 4.1 The drift screen
 
@@ -430,6 +438,10 @@ Three readings:
 - **The change is a small uniform lift, not a compression.** `d@high` is within
   0.01 of zero at every checkpoint, so the confident activations are essentially
   untouched; the ~6 % is spread across the range.
+  → **Revised by §4.3.1.** The level-resolved breakdown shows it is in fact a mild
+  compression crossing zero at ≈ 0.45, and that ~71 % of the "+6 %" is the
+  near-empty background bins rising by +0.0006 each. `drift_stats()` reports only
+  `d@high`, so it could not see either.
 - **`r = 1.00` means the map *shape* is preserved.** Voice-relative comparisons
   and threshold sweeps on this model should therefore behave like model3's, which
   is the property the anchor was built to protect.
@@ -450,35 +462,476 @@ It does **not** establish detection accuracy, per-voice evenness, or that the
 deliberately blind to those: it asks only "did the output move", and its answer
 here is "barely". A model could pass it perfectly by learning nothing at all.
 
-### 4.3 The outstanding evaluation
+§4.3 measures those three directly on one excerpt. Its verdict on this
+section's precondition is favourable — the equivalent threshold came out at
+exactly 0.50 — but its verdict on the +0.116 is that it did **not** appear as
+detection accuracy, and appeared only weakly as evenness.
 
-To settle it, the procedure from the sibling report on the AdaBN variant should be
-repeated on `e01` and `e02`:
+### 4.3 Real-audio evaluation
 
-- salience maps via `predict_on_audio.py --save_salience`, analysed with
-  `finetune/compare_voice_salience.py` (peak-picked, ±80 cent match), against each
-  excerpt's own MIDI;
-- detection F **at the default 0.50, at a matched detection count, and at each
-  model's own best threshold** — the three columns that separate calibration from
-  accuracy;
-- per-chord **evenness across voices** (spread and min/max relative to the loudest
-  voice), which is the property actually targeted.
+§4.3.1–4.3.4 cover `e01` vs baseline on `late_dada`; §4.3.5 compares the two
+candidate checkpoints; §4.3.6 repeats the evaluation on `Parijs_dedetdoe`;
+**§4.3.7 is the summary across both excerpts and the section to read first.**
 
-Until that exists, this model should be treated as **an unvalidated candidate**.
-A synthetic gain of this shape is not self-evidently transferable: the sibling
-report documents a variant that posted a *larger* synthetic improvement and was
-then worse on both real recordings. The difference in this run's favour is §4.1 —
-that model's salience was compressed ~20 % with `r = 0.66–0.85`, this one's is
-lifted ~6 % with `r ≈ 1.00` — but that is a reason to expect transfer, not
-evidence of it.
+#### 4.3.0 `e01` on `late_dada`
+
+Date: 2026-08-06. Checkpoint `exp3multif0_finetuned_distill_conv_e01.weights.h5`
+— the one §3.5 recommends — against the baseline `exp3multif0.h5`.
+
+```bash
+python predict_on_audio.py --model model3 --save_salience \
+    --model_weights ./models/exp3multif0_finetuned_distill_conv_e01.weights.h5 \
+    --audiofile late_dada.wav        # and once without --model_weights
+
+python finetune/compare_voice_salience.py \
+    --salience late_dada_model3_exp3multif0_salience.npz \
+               late_dada_model3_exp3multif0_finetuned_distill_conv_e01.weights_salience.npz \
+    --midi "Late Night Talking - Full score - Late Night Talking.mid" \
+    --measures 1-4
+```
+
+Excerpt: 7.78 s, 4 voices (Soprano / Mezzo / Tenor / Bass), 6 chords, 2,659
+reference pitches. Warp fitted at `scale=0.860 offset=+0.280` (performance +16 %
+vs score tempo), score/salience correlation **r = 0.416**. Pitch tolerance
+±80 cents.
+
+**Note on excerpt choice.** `late_dada.wav` is one of the two `--real_audio` guard
+excerpts. It carried **no gradient** — `late.flac`, the take it was cut from, was
+deliberately removed from the distillation pool (§2.3) — but it *did* enter the
+checkpoint accept/reject decision via `drift_stats()`. So this is held out from
+training but not from selection. §4.4 covers the fully-independent excerpt.
+
+#### 4.3.1 Whole-map
+
+| | baseline | `e01` |
+|---|---|---|
+| mean salience | 0.0130 | 0.0138 (**+6 %**) |
+| bins > 0.50 | 2,052 | 2,064 (+0.6 %) |
+| correlation `r` vs baseline | — | **0.995** |
+| threshold matching baseline's selectivity at 0.50 | 0.50 | **0.50** |
+
+The two models sit at the **same operating point** — equivalent threshold 0.50,
++0.6 % on bins above it. Every comparison below is therefore like-for-like, which
+is the precondition §4.2 required.
+
+Change as a function of the baseline's own activation level:
+
+| baseline bin | n bins | Δ `e01` |
+|---|---|---|
+| 0.00 – 0.05 | 231,321 | +0.0006 |
+| 0.05 – 0.10 | 2,752 | **+0.0112** |
+| 0.10 – 0.20 | 2,428 | **+0.0116** |
+| 0.20 – 0.30 | 1,289 | +0.0077 |
+| 0.30 – 0.40 | 909 | +0.0032 |
+| 0.40 – 0.50 | 808 | −0.0007 |
+| 0.50 – 0.60 | 753 | −0.0037 |
+| 0.60 – 0.70 | 620 | −0.0069 |
+| 0.70 – 0.80 | 367 | −0.0098 |
+| 0.80 – 0.90 | 231 | −0.0143 |
+| 0.90 – 1.00 | 82 | −0.0141 |
+
+This **revises §4.1's reading**. The change is not a uniform lift: on this excerpt
+it is a mild *compression*, crossing zero at ≈ 0.45 — weak and mid activations
+rise, confident ones fall. The direction is the intended one (evidence for a faint
+voice is worth more than another decibel on an already-certain detection), and the
+magnitude is small — ≤ 0.014 everywhere, hence `r = 0.995`. §4.1 could not see the
+crossover because `drift_stats()` reports only `d@high`, which is the last two
+rows.
+
+> **Qualified by §4.3.6.** On the second excerpt the lift stays positive up to
+> ≈ 0.85, so the crossover point is not a property of the model. What replicates
+> across both is the rise of the 0.05–0.30 bins by +0.011 to +0.012; the high-end
+> behaviour is excerpt-dependent (§4.3.7).
+
+The headline "+6 %" is also **not** what it sounds like. Decomposing the +0.0008
+mean shift by row, **71 % of it comes from the 0.00–0.05 bin alone** — 95.8 % of
+all bins, creeping up by +0.0006 each. It is background, not signal, and 6 % of a
+mean of 0.013 is a very small absolute number. The same caution applies to the
++4–7 % figures throughout §4.1.
+
+#### 4.3.2 Detection accuracy
+
+Peak-picked, ±80 cent match against the score.
+
+| | baseline | `e01` |
+|---|---|---|
+| P / R / F @ 0.50 (default) | 0.889 / 0.299 / **0.448** | 0.886 / 0.300 / **0.448** |
+| P / R / F @ matched count (894 peaks) | 0.889 / 0.299 / **0.448** | 0.886 / 0.300 / **0.448** (901 peaks) |
+| best F over the sweep | **0.546** @ 0.15 | **0.542** @ 0.15 |
+
+**Flat.** All three columns agree within ±0.004, which is smaller than the sd of
+the synthetic metric (§3.1) and far smaller than anything that would matter. The
+per-threshold sweep is flat too: across 0.15–0.80 the largest F difference in
+either direction is 0.007. **The +0.116 synthetic quiet-voice gain of §3.4 did not
+show up as detection accuracy on this excerpt.**
+
+Note also that **best F sits at 0.15, the bottom of the swept grid** — for both
+models. The true optimum is below it. This is direct support for §5's suspicion
+that 0.5 is the wrong operating point for real audio, and it is worth noting that
+recall at the default 0.50 is only ~0.30 for either model.
+
+#### 4.3.3 Per-voice evenness — the targeted property
+
+Salience read at each voice's known F0; relative values are per-chord, against the
+loudest voice.
+
+| | baseline | `e01` | Δ |
+|---|---|---|---|
+| spread (max−min of relative), mean over 6 chords | 0.738 | **0.708** | **−0.030** |
+| min/max (quietest vs loudest), mean over 6 chords | 0.262 | **0.292** | **+0.030** |
+
+Both move the intended way: **voices more even**. The effect is entirely the Bass
+line, and only where the Bass is actually present:
+
+| chord | Bass pitch | baseline rel | `e01` rel |
+|---|---|---|---|
+| 1 | G3 | 0.30 | **0.35** |
+| 2 | C3 | 0.08 | **0.11** |
+| 3 | F3 | 0.89 | **0.97** |
+| 4 | F2 | 0.00 | 0.00 |
+| 5 | A♯2 | 0.00 | 0.01 |
+| 6 | D3 | 0.45 | **0.53** |
+
+Soprano, Mezzo and Tenor move by ≤ 0.03 in either direction — as expected, since
+they are the loud voices the anchor pins. In chords 4 and 5 the Bass reads
+**absolutely zero salience** (0.000 / 0.001 raw) at F2 (87 Hz) and A♯2 (116 Hz);
+that is not a quiet voice the model under-reads, it is no energy at all at those
+pitches, and no amount of low-end sensitivity will recover it. Those two chords
+contribute a spread of exactly 1.00 to both models and dilute the mean.
+
+Excluding them, the four chords where the Bass sounds give spread 0.63 → 0.56 and
+min/max 0.35 → 0.42 — roughly **double** the aggregate effect, and the honest
+figure for "chords where the target property is measurable".
+
+#### 4.3.4 Reading
+
+> Written on `late_dada` alone. **Superseded by §4.3.7**, which reconciles it with
+> the second excerpt: the evenness result replicates exactly, the detection
+> result is flat-to-slightly-positive rather than flat, and the compression
+> reading below turns out to be excerpt-specific.
+
+The three measurements say different things and should not be averaged:
+
+- **Calibration is preserved** (§4.3.1). `r = 0.995`, identical equivalent
+  threshold. The anchor did its job; this is the clearest positive result, and it
+  is what the AdaBN sibling failed.
+- **Detection accuracy is unchanged** (§4.3.2). Not better, not worse. The
+  synthetic recall gain did not transfer as F on this excerpt.
+- **Voice evenness improved slightly** (§4.3.3), concentrated exactly where the
+  method predicts — the quietest voice, in chords where it is audible at all.
+- **All three replicate on `e02`** (§4.3.5), an independently-selected checkpoint
+  460 steps later. That rules out the pattern being one checkpoint's noise.
+
+So the model is **not harmful and mildly helpful on the property it targets**,
+which is a materially better outcome than the AdaBN variant (worse on both real
+recordings), but it is a small effect on one short excerpt. The gap between
++0.116 synthetic quiet recall and +0.030 real evenness / +0.000 real F is the
+substantive finding here, and §5 lists the candidate explanations —
+soundfont-specific gains, the anchor pinning toward a teacher that itself misses
+quiet voices, and a synthetic victim level (−12 dB) that may not resemble real
+ensemble imbalance.
+
+#### 4.3.5 `e01` vs `e02` — the two candidate checkpoints
+
+**On `late_dada`.** Same excerpt, same procedure (warp fitted identically at
+`scale=0.860 offset=+0.280`, `r = 0.417`), `e02` as the baseline column:
+
+| | `e02` | `e01` |
+|---|---|---|
+| mean salience | 0.0136 | 0.0138 (+1 %) |
+| bins > 0.50 | 2,065 | 2,064 |
+| correlation `r` | — | **0.999** |
+| equivalent threshold | 0.50 | **0.50** |
+| P / R / F @ 0.50 | 0.889 / 0.300 / 0.449 | 0.886 / 0.300 / 0.448 |
+| P / R / F @ matched count (901 peaks) | 0.888 / 0.301 / **0.449** | 0.886 / 0.300 / **0.448** |
+| best F | **0.546** @ 0.15 | 0.542 @ 0.15 |
+| spread (mean) | 0.712 | **0.708** |
+| min/max (mean) | 0.288 | **0.292** |
+
+**The two checkpoints are the same model for practical purposes.** `r = 0.999`,
+identical equivalent threshold, and every difference — detection F, spread,
+min/max — is ≤ 0.004, which is exactly the sd of the synthetic quiet-recall
+plateau (§3.1). The level-resolved deltas peak at +0.0045 and are ≈ 0 above 0.50.
+`e02` is a hair better on detection (F 0.546 vs 0.542, precision +0.002 to +0.008
+across the sweep), `e01` a hair better on evenness; neither difference is
+meaningful.
+
+> The tool reports "quiet voice better held in **6 of 6** chords" for `e01`. That
+> is a sign test on differences of ≤ 0.01 — three of the six chords tie to two
+> decimals (0.00/0.00, 0.53/0.53) and are decided at floating-point precision. It
+> is not evidence of anything.
+
+This **empirically confirms §3.1's convergence claim**: the run had plateaued by
+the end of epoch 1, and 460 further optimizer steps produced no change detectable
+on real audio. It also confirms §3.5 — the choice between these checkpoints, and
+the `+0.123` figure that put `e02_s001122` in `--out`, is selection over noise.
+
+The more useful consequence is a **replication of §4.3.1–4.3.3 against the
+baseline**, since `e02` was selected independently of `e01`:
+
+| | baseline | `e02` | `e01` |
+|---|---|---|---|
+| mean salience | 0.0130 | 0.0136 | 0.0138 |
+| best F | 0.546 | 0.546 | 0.542 |
+| F @ 0.50 | 0.448 | 0.449 | 0.448 |
+| spread (mean) | 0.738 | **0.712** | **0.708** |
+| min/max (mean) | 0.262 | **0.288** | **0.292** |
+
+Both checkpoints land in the same place: **detection F flat to ±0.004, evenness
+improved by +0.026 to +0.030.** The §4.3.4 reading is therefore not an artifact of
+which checkpoint was picked.
+
+**On `Parijs_dedetdoe`.** The same comparison, repeated on the second excerpt
+(warp `scale=0.840 offset=+0.280`, `r = 0.507`):
+
+| | `e02` | `e01` |
+|---|---|---|
+| mean salience | 0.0250 | 0.0253 (+1 %) |
+| bins > 0.50 | 2,845 | 2,863 |
+| correlation `r` | — | **1.000** |
+| equivalent threshold | 0.50 | **0.50** |
+| P / R / F @ 0.50 | 0.841 / 0.552 / 0.666 | 0.842 / 0.555 / **0.669** |
+| P / R / F @ matched count (1,137 peaks) | 0.841 / 0.552 / 0.666 | 0.842 / 0.555 / **0.669** |
+| best F | 0.705 @ 0.15 | 0.706 @ 0.20 |
+| spread (mean) | 0.520 | **0.514** |
+| min/max (mean) | 0.480 | **0.486** |
+
+Identical conclusion, and slightly cleaner: `r = 1.000` to three decimals, every
+metric within 0.006, level-resolved deltas peaking at +0.0046 and ≈ 0 above 0.80.
+Here `e01` is marginally ahead on *both* detection and evenness rather than
+splitting them — which, given the margins, is itself just noise resolving
+differently. The sign test flips too: "better held in **2 of 4** chords" here
+against "**6 of 6**" on `late_dada`, on differences of the same ≤ 0.01 size,
+confirming that line carries no information.
+
+`e02` against the baseline on this excerpt replicates §4.3.6 as well:
+
+| | baseline | `e02` | `e01` |
+|---|---|---|---|
+| mean salience | 0.0240 | 0.0250 | 0.0253 |
+| F @ 0.50 | 0.664 | 0.666 | 0.669 |
+| F @ 0.70 | 0.583 | **0.596** | **0.599** |
+| F @ 0.75 | 0.541 | **0.560** | **0.563** |
+| best F | 0.708 | 0.705 | 0.706 |
+| spread (mean) | 0.545 | **0.520** | **0.514** |
+| min/max (mean) | 0.455 | **0.480** | **0.486** |
+
+The high-threshold recall gain of §4.3.6 is present in `e02` too (+0.013 at 0.70,
++0.019 at 0.75), so it is not an `e01` artifact either.
+
+**Summary of the 2 × 2.** Across both checkpoints and both excerpts, the evenness
+gain over baseline is +0.025, +0.026, +0.030, +0.031 — a tight cluster. The
+checkpoint choice moves it by ≤ 0.006; the excerpt choice by ≤ 0.001. `e01` and
+`e02` can be treated as interchangeable, and the result is robust to which one is
+shipped.
+
+#### 4.3.6 Second excerpt: `Parijs_dedetdoe`
+
+`e01` vs baseline on the other `--real_audio` guard excerpt: 4.82 s, **5 voices**
+(Sopraan / Mezzo / Alt / Tenor / Bas), 4 chords, 1,732 reference pitches, scored
+against `Kenny B - Parijs.mid` measures 1–2. Warp fitted at `scale=0.840
+offset=+0.280`, **r = 0.505** — a better alignment than `late_dada`'s 0.416.
+
+This is the **more informative of the two excerpts**: every voice is audible in
+every chord (no zero readings anywhere), so all four chords bear on the targeted
+property, versus four of six on `late_dada`. Baseline detection is also far
+healthier here — F ≈ 0.66 at 0.50 and recall 0.55, against 0.45 and 0.30.
+
+**Whole-map**
+
+| | baseline | `e01` |
+|---|---|---|
+| mean salience | 0.0240 | 0.0253 (**+6 %**) |
+| bins > 0.50 | 2,807 | 2,863 (+2 %) |
+| correlation `r` | — | **0.996** |
+| equivalent threshold | 0.50 | **0.51** |
+
+| baseline bin | n bins | Δ `e01` |
+|---|---|---|
+| 0.00 – 0.05 | 139,254 | +0.0008 |
+| 0.05 – 0.10 | 2,566 | **+0.0119** |
+| 0.10 – 0.20 | 2,475 | **+0.0120** |
+| 0.20 – 0.30 | 1,148 | **+0.0116** |
+| 0.30 – 0.40 | 787 | +0.0059 |
+| 0.40 – 0.50 | 723 | +0.0096 |
+| 0.50 – 0.60 | 831 | +0.0041 |
+| 0.60 – 0.70 | 757 | +0.0042 |
+| 0.70 – 0.80 | 467 | +0.0014 |
+| 0.80 – 0.90 | 390 | −0.0008 |
+| 0.90 – 1.00 | 362 | −0.0032 |
+
+The `+6 %` mean and `r ≈ 1.00` replicate `late_dada` exactly. The *shape* does
+not: here the lift stays positive up to ≈ 0.85, whereas on `late_dada` it crossed
+zero at ≈ 0.45. **The level-dependence is excerpt-specific** — see §4.3.7. As
+before, the mean shift is dominated by background: 55 % of the +0.0013 comes from
+the 0.00–0.05 bin (93 % of all bins).
+
+**Detection accuracy**
+
+| | baseline | `e01` |
+|---|---|---|
+| P / R / F @ 0.50 | 0.842 / 0.548 / 0.664 | 0.842 / 0.555 / **0.669** |
+| P / R / F @ matched count (1,128 peaks) | 0.842 / 0.548 / 0.664 | 0.844 / 0.551 / **0.666** (@0.51) |
+| best F | **0.708** @ 0.15 | 0.706 @ 0.20 |
+
+Flat at the default and at matched count, as on `late_dada` — but with a pattern
+absent there. **At high thresholds `e01` is consistently better at equal
+precision:**
+
+| thr | baseline F | `e01` F | Δ |
+|---|---|---|---|
+| 0.65 | 0.610 | 0.617 | +0.007 |
+| 0.70 | 0.583 | 0.599 | **+0.016** |
+| 0.75 | 0.541 | 0.563 | **+0.022** |
+| 0.80 | 0.503 | 0.519 | +0.016 |
+
+Precision is within 0.002 across these rows, so this is recall gained, not an
+operating-point trade. That is the signature the method predicts: activations
+just under a high threshold are pushed over it, while confident detections and
+the noise floor stay put. It does not show up at 0.15–0.50 because there the
+threshold is already below the lifted mass.
+
+**Per-voice evenness**
+
+| | baseline | `e01` | Δ |
+|---|---|---|---|
+| spread (mean over 4 chords) | 0.545 | **0.514** | **−0.031** |
+| min/max (mean over 4 chords) | 0.455 | **0.486** | **+0.031** |
+
+Near-identical in magnitude to `late_dada` (−0.030 / +0.030). Again concentrated
+in the quietest voices, and again the loud voices barely move:
+
+| chord | quietest voice | baseline rel | `e01` rel |
+|---|---|---|---|
+| 1 | Bas F♯3 | 0.38 | 0.38 |
+| 2 | Bas A3 | 0.69 | 0.68 |
+| 3 | Bas D3 | 0.29 | **0.32** |
+| 4 | Bas A2 | 0.47 | **0.57** |
+
+Chord 4 carries most of it — Bas A2 rises 0.377 → 0.457 raw and Tenor B3
+0.432 → 0.489, dropping that chord's spread from 0.53 to 0.43. Chord 2, where the
+ensemble is already even (spread 0.31), moves −0.01 the wrong way. So the
+improvement appears **where there is an imbalance to correct and not otherwise**,
+which is the desired behaviour rather than a blanket gain.
+
+#### 4.3.7 Cross-excerpt summary
+
+The full design is **2 checkpoints × 2 excerpts**, all against the baseline:
+
+| | `late_dada` `e01` | `late_dada` `e02` | `Parijs` `e01` | `Parijs` `e02` |
+|---|---|---|---|---|
+| Δ spread | **−0.030** | **−0.026** | **−0.031** | **−0.025** |
+| Δ min/max | **+0.030** | **+0.026** | **+0.031** | **+0.025** |
+| Δ F @ 0.50 | 0.000 | +0.001 | +0.005 | +0.002 |
+| Δ F @ 0.70–0.80 | −0.002 to −0.007 | ≈ 0 | **+0.016 to +0.022** | **+0.013 to +0.019** |
+| map `r` vs baseline | 0.995 | ~0.995 | 0.996 | ~0.996 |
+
+Per excerpt, with `e01` as the representative checkpoint:
+
+| | `late_dada` | `Parijs_dedetdoe` |
+|---|---|---|
+| voices / chords used | 4 / 6 (2 unusable) | 5 / 4 (all usable) |
+| warp fit `r` | 0.416 | 0.505 |
+| baseline F @ 0.50 | 0.448 | 0.664 |
+| mean salience | +6 % | +6 % |
+| map correlation `r` | 0.995 | 0.996 |
+| equivalent threshold | 0.50 | 0.51 |
+| Δ F @ 0.50 | 0.000 | **+0.005** |
+| Δ F @ matched count | 0.000 | **+0.002** |
+| Δ best F | −0.004 | −0.002 |
+| Δ F @ 0.70–0.80 | −0.002 to −0.007 | **+0.016 to +0.022** |
+| Δ spread | **−0.030** | **−0.031** |
+| Δ min/max | **+0.030** | **+0.031** |
+
+What replicates:
+
+- **Calibration preservation.** `r ≈ 0.996`, equivalent threshold 0.50–0.51, mean
+  +6 % on both. This is now well established, and it is the property the anchor
+  was built for.
+- **Voice evenness.** All four cells fall in **+0.025 to +0.031**. Two recordings,
+  different ensembles, different voice counts, two independently-selected
+  checkpoints, same magnitude. This is the strongest evidence in the report that
+  the fine-tune does what it was meant to on real audio.
+- **Lift of weak-to-mid activations.** The 0.05–0.30 bins rise by +0.011 to
+  +0.012 on both excerpts — the single most consistent number in the comparison.
+- **Checkpoint-invariance.** `e01` and `e02` agree to ≤ 0.006 on every metric on
+  both excerpts (§4.3.5), so none of the above depends on which was shipped.
+
+What does not:
+
+- **High-end behaviour.** `late_dada` falls −0.014 at 0.80–0.90; `Parijs` falls
+  −0.0008. The "mild compression" of §4.3.1 is one excerpt's shape, not the
+  model's. What both share is the lift below 0.30; above it they diverge.
+- **Detection accuracy.** Flat on `late_dada`, slightly positive on `Parijs`
+  (+0.005 at 0.50, +0.016 to +0.022 at 0.70–0.80, replicated by `e02` at +0.013
+  to +0.019). The `Parijs` result is the more trustworthy — better alignment, no
+  dead voices, baseline F 0.66 vs 0.45 — and the high-threshold gain now holds for
+  both checkpoints, which makes it more than a single artifact. But it is still
+  one 4.8 s excerpt, and it vanishes at the thresholds where F actually peaks.
+  **The defensible statement remains: detection accuracy is not harmed, and may be
+  marginally helped at high thresholds.**
+
+This supersedes §4.3.4, which was written on `late_dada` and `e01` alone.
+
+### 4.4 What remains
+
+- **A fully independent excerpt**, in neither the distillation pool nor the guard
+  set. **This is now the only substantial gap.** Both excerpts scored so far are
+  `--real_audio` guard excerpts: no gradient touched them, but both fed the
+  checkpoint accept/reject decision, so they are held out from training and not
+  from selection.
+- **A threshold sweep extended below 0.15**, since best F sits at or beside the
+  grid edge on both excerpts (0.15, 0.15, 0.20). The deployment operating point is
+  still unknown, and every comparison here was made at thresholds that are
+  probably too high — which matters, because §4.3.6 finds the model's clearest
+  accuracy gain at 0.70–0.80 and nothing at 0.15–0.50.
+- **Longer excerpts.** 7.8 s and 4.8 s, 10 chords in total. The evenness effect
+  replicated at +0.030 on both, but neither carries error bars.
+
+**Settled by §4.3.5:** `e02` is indistinguishable from `e01` on **both** excerpts
+(`r = 0.999` and `1.000`, all metrics within 0.006). Either can be shipped; the
+choice between them is not worth further evaluation, and `e02_s001122` in `--out`
+should be replaced by either one.
+
+**Settled by §4.3.6:** the `late_dada` dead-bass problem — the second excerpt has
+all five voices audible in all four chords.
+
+This model is now a **candidate validated on two guard excerpts**: shown not to
+regress, shown to preserve calibration (`r ≈ 0.996` on both), and shown a
+consistent **+0.025 to +0.031** gain on the targeted property across the full
+2 × 2 of recordings and checkpoints. What is missing is a recording with no
+selection contact.
 
 ---
 
 ## 5. Limitations
 
-- **No real-audio accuracy evaluation.** §4 is a distribution check, not a
-  measurement of detection accuracy or voice evenness. This is the single largest
-  gap in the report and the reason the model is not recommended for use yet.
+- **Real-audio evaluation covers two short guard excerpts, both with selection
+  contact.** 7.8 s + 4.8 s, 10 chords. Neither carried gradient, but both fed the
+  checkpoint accept/reject guard, so both are held out from training and not from
+  selection. No fully independent recording has been scored (§4.4). This is the
+  largest remaining gap.
+- **The synthetic gain transferred only partially.** +0.116 inferred quiet-voice
+  recall on soundfont renders (§3.4) became **+0.025 to +0.031 voice evenness**
+  across all four excerpt × checkpoint cells and **+0.000 to +0.005 detection F**
+  at the default threshold (§4.3.7). Candidate explanations —
+  not distinguished by any measurement here — are that the gain is
+  soundfont-specific; that the anchor pins the student toward a teacher which
+  itself misses quiet voices (see below); that a −12 dB synthetic victim does not
+  resemble real ensemble imbalance; or that §3.4's inferred `R_quiet` overstates
+  the effect. The consistency of the evenness figure across two excerpts argues
+  for a real but small effect rather than noise.
+- **The alignments are moderate at best.** `compare_voice_salience.py` fitted the
+  tempo warp at score/salience `r = 0.416` (`late_dada`) and `r = 0.505`
+  (`Parijs`). The script's own docstring names a weak fit as the usual reason a
+  voice reads near zero, so the two zero-Bass chords in §4.3.3 are not
+  conclusively absent energy rather than misalignment — though F2/A♯2 in a
+  recording whose other voices are S/M/T makes genuine absence the likelier
+  reading, and `Parijs` at the better fit has no zero readings at all.
+- **The level-dependence of the change does not replicate.** §4.3.1 and §4.3.6
+  disagree on where the salience shift crosses zero (≈ 0.45 vs ≈ 0.85). Only the
+  lift of the 0.05–0.30 bins is common to both. Any account of *how* this model
+  differs from the baseline should rest on that, not on the compression story.
 - **All training and validation material is synthetic**, soundfont-rendered from
   generated MIDI, from one soundfont and one seed.
 - **One validation scene.** 120 chord pairs is a reasonable frame-level sample,
@@ -487,7 +940,10 @@ evidence of it.
   is the scale at which §3.4's +0.116 should be read (large relative to noise) and
   §3.5's +0.123 should not (inside it).
 - **Selection over 24 checkpoints biases the reported best**, as quantified in
-  §3.5. The guards are absolute tolerances and do not correct for this.
+  §3.5. The guards are absolute tolerances and do not correct for this. The
+  practical consequence turned out to be nil — §4.3.5 shows the top checkpoints
+  are indistinguishable on real audio, so picking a noise peak cost nothing here —
+  but that is luck, not a property of the selection rule.
 - **Positive drift is not guarded.** `guard_failures()` rejects only
   `real_worst < −drift_tol` and `real_d_high < −drift_high_tol`. This run's +4–7 %
   upward lift passed unchecked; it was read off the log manually. A run that
@@ -510,10 +966,13 @@ evidence of it.
 - **The anchor sees 26 of 50 frames per window.** The ±12-frame receptive-field
   crop discards roughly half of each window; the effective anchored duration is
   ~13.7 min of the 26.4 min pool.
-- **Threshold 0.5 may be the wrong operating point.** All of §3 is scored there,
-  and there is independent evidence that 0.5 is far too high for real audio. The
-  synthetic ranking of checkpoints is still informative, but the absolute recall
-  and precision figures are unlikely to describe deployment.
+- **Threshold 0.5 is very likely the wrong operating point.** All of §3 is scored
+  there. §4.3.2 now shows directly that on real audio both models peak at F ≈ 0.54
+  at **0.15, the bottom of the swept grid** — the true optimum is lower still, and
+  recall at 0.50 is only ~0.30. The synthetic ranking of checkpoints is still
+  informative, but the absolute recall and precision figures in §3 do not describe
+  deployment, and the real-audio comparison in §4.3 has not been repeated at a
+  sensible operating point.
 - **Contributions are not separated.** `--pos_weight 4`, the anchor at λ=3, γ=1,
   and a functioning L2-SP all changed at once relative to plain `conv`
   fine-tuning. No ablation isolates them, so the attribution in §1 is mechanistic

@@ -25,7 +25,7 @@ tf.config.threading.set_inter_op_parallelism_threads(0)
 CHUNK_LEN = 2000
 
 
-def save_salience_map(salience, save_path, model_name, thresh):
+def save_salience_map(salience, save_path, model_name, thresh, weights_path=None):
     """Store the raw (freq, time) salience map so it can be re-analysed without
     re-running inference -- e.g. sweeping the threshold offline, or reading the
     salience value at a known F0 instead of a binary detected/not-detected.
@@ -40,6 +40,7 @@ def save_salience_map(salience, save_path, model_name, thresh):
         salience=salience.astype(np.float16),
         freq_grid=freq_grid, time_grid=time_grid,
         model_name=model_name, thresh=thresh,
+        weights_path=weights_path if weights_path is not None else '',
     )
 
 
@@ -137,17 +138,6 @@ def main(args):
         model.load_weights(model_path)
         thresh = 0.5
 
-    elif model_name == 'model3_adabn':
-
-        # model3's architecture with AdaBN-refined weights: BatchNorm recalibrated
-        # on synthetic SSATBB chords containing one attenuated voice, to reduce the
-        # "quiet voice -> low salience" bias. See models/exp3multif0_finetuned.md.
-        save_key = 'exp3multif0_finetuned_AdaBN'
-        model_path = "./models/{}.weights.h5".format(save_key)
-        model = models.build_model3()
-        model.load_weights(model_path)
-        thresh = 0.5
-
     elif model_name == 'model4':
 
         save_key = 'exp4multif0'
@@ -167,11 +157,23 @@ def main(args):
     else:
         raise ValueError(
             "Specified model must be one of: model1, model2, model3, "
-            "model3_adabn, model4, model7.")
+            "model4, model7.")
 
     # allow overriding the model's default global threshold from the CLI
     if args.thresh is not None:
         thresh = args.thresh
+
+    # allow overriding the model's default weights file, so different
+    # checkpoints of the same architecture can be compared side by side
+    if args.model_weights is not None:
+        model_path = args.model_weights
+        model.load_weights(model_path)
+
+    # label identifying both the architecture and the weights used, so
+    # outputs from different checkpoints don't overwrite each other and
+    # stay distinguishable when comparing plots/CSVs side by side
+    weights_label = os.path.splitext(os.path.basename(model_path))[0]
+    label = '{}_{}'.format(model_name, weights_label)
 
     # compile model
 
@@ -204,13 +206,13 @@ def main(args):
 
         if plot_salience:
             utils_train.plot_salience(
-                predicted_output, '{}_{}_salience.png'.format(stem, model_name),
-                est_times, est_freqs, model_name=model_name
+                predicted_output, '{}_{}_salience.png'.format(stem, label),
+                est_times, est_freqs, model_name=label
             )
 
         if save_salience:
-            path = '{}_{}_salience.npz'.format(stem, model_name)
-            save_salience_map(predicted_output, path, model_name, thresh)
+            path = '{}_{}_salience.npz'.format(stem, label)
+            save_salience_map(predicted_output, path, model_name, thresh, weights_path=model_path)
             print(" > > > Salience map saved as {}.".format(path))
 
         # rearrange output
@@ -218,7 +220,7 @@ def main(args):
             if any(fqs <= 0):
                 est_freqs[i] = np.array([f for f in fqs if f > 0])
 
-        output_path = '{}_{}.csv'.format(stem, model_name)
+        output_path = '{}_{}.csv'.format(stem, label)
         utils_train.save_multif0_output(est_times, est_freqs, output_path)
 
         print(" > > > Multiple F0 prediction for {} exported as {}.".format(
@@ -256,17 +258,17 @@ def main(args):
                 utils_train.plot_salience(
                     predicted_output,
                     save_path=os.path.join(
-                        audio_folder, '{}_{}_salience.png'.format(stem, model_name)
+                        audio_folder, '{}_{}_salience.png'.format(stem, label)
                     ),
                     est_times=est_times, est_freqs=est_freqs,
-                    model_name=model_name
+                    model_name=label
                 )
 
             if save_salience:
                 path = os.path.join(
-                    audio_folder, '{}_{}_salience.npz'.format(stem, model_name)
+                    audio_folder, '{}_{}_salience.npz'.format(stem, label)
                 )
-                save_salience_map(predicted_output, path, model_name, thresh)
+                save_salience_map(predicted_output, path, model_name, thresh, weights_path=model_path)
                 print(" > > > Salience map saved as {}.".format(path))
 
             # rearrange output
@@ -275,7 +277,7 @@ def main(args):
                     est_freqs[i] = np.array([f for f in fqs if f > 0])
 
             output_path = os.path.join(
-                audio_folder, '{}_{}.csv'.format(stem, model_name)
+                audio_folder, '{}_{}.csv'.format(stem, label)
             )
             utils_train.save_multif0_output(est_times, est_freqs, output_path)
 
@@ -296,9 +298,17 @@ if __name__ == "__main__":
                         help="Specify the ID of the model "
                              "to use for the prediction: model1 (Early/Deep) / "
                              "model2 (Early/Shallow) / "
-                             "model3 (Late/Deep, recommended) / "
-                             "model3_adabn (model3 with AdaBN-refined weights, "
-                             "less biased against quiet voices in an ensemble)")
+                             "model3 (Late/Deep, recommended)")
+
+    parser.add_argument("--model_weights",
+                        dest='model_weights',
+                        default=None,
+                        type=str,
+                        help="Path to a weights file (.h5 / .weights.h5) overriding the "
+                             "model's default checkpoint, so different fine-tuned "
+                             "weights of the same architecture can be compared. The "
+                             "weights filename is included in the salience plot title, "
+                             "the salience map, and the output CSV filename.")
 
     parser.add_argument("--audiofile",
                         dest='audiofile',

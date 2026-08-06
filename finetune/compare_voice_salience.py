@@ -52,8 +52,8 @@ Inputs are the .npz salience maps written by predict_on_audio.py --save_salience
 Example
 -------
     python finetune/compare_voice_salience.py \
-        --salience model3=Parijs_model3_salience.npz \
-                   adabn=Parijs_model3_adabn_salience.npz \
+        --salience Parijs_model3_exp3multif0_salience.npz \
+                   Parijs_model3_exp3multif0_finetuned_AdaBN_salience.npz \
         --midi "Kenny B - Parijs.mid" --measures 1-2
 """
 
@@ -203,6 +203,30 @@ def read_score(midi_path, m_from, m_to, bpm=None, beats_per_measure=4):
 def load_salience(path):
     d = np.load(path, allow_pickle=True)
     return (d['salience'].astype(np.float32), d['freq_grid'], d['time_grid'])
+
+
+def names_from_filenames(paths):
+    """Derive a short comparison name per path from the part of its filename
+    that differs between paths (predict_on_audio.py names salience maps
+    '<audio-stem>_<model>_<weights>_salience.npz', so the shared audio stem
+    and the shared '_salience' suffix carry no comparison information)."""
+    stems = [os.path.splitext(os.path.basename(p))[0] for p in paths]
+    if len(stems) < 2:
+        return stems
+
+    split = [s.split('_') for s in stems]
+    n_pre = 0
+    while n_pre < min(len(s) for s in split) and len({s[n_pre] for s in split}) == 1:
+        n_pre += 1
+    n_suf = 0
+    while (n_suf < min(len(s) for s in split) - n_pre
+           and len({s[-1 - n_suf] for s in split}) == 1):
+        n_suf += 1
+
+    names = ['_'.join(s[n_pre:len(s) - n_suf]) or s[n_pre - 1] for s in split]
+    if len(set(names)) != len(names):
+        return stems
+    return names
 
 
 def voice_salience(sal, fgrid, tgrid, f0, t0, t1, scale, offset, tol_cents):
@@ -412,10 +436,8 @@ def fit_warp(models, chords, tol_cents, scales, offsets):
 # --------------------------------------------------------------------------
 def main(args):
     models = {}
-    for spec in args.salience:
-        if '=' not in spec:
-            raise SystemExit("--salience expects name=path.npz, got %r" % spec)
-        name, path = spec.split('=', 1)
+    names = names_from_filenames(args.salience)
+    for name, path in zip(names, args.salience):
         models[name] = load_salience(path)
         print("loaded %-10s %s  %s  %.2f s"
               % (name, os.path.basename(path), models[name][0].shape,
@@ -511,9 +533,13 @@ def main(args):
 if __name__ == '__main__':
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--salience', nargs='+', required=True, metavar='NAME=PATH',
-                   help='salience maps to compare, e.g. model3=a.npz adabn=b.npz. '
-                        'The first is the baseline for the final comparison.')
+    p.add_argument('--salience', nargs='+', required=True, metavar='PATH',
+                   help='salience maps to compare, e.g. '
+                        'Parijs_model3_exp3multif0_salience.npz '
+                        'Parijs_model3_exp3multif0_finetuned_AdaBN_salience.npz. '
+                        'Comparison names are derived from the part of each '
+                        'filename that differs between them. The first is the '
+                        'baseline for the final comparison.')
     p.add_argument('--midi', required=True, help='score, one track per voice')
     p.add_argument('--measures', default='1-2',
                    help='measure range the recording covers, e.g. 1-2 (1-based)')
