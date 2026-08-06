@@ -1,0 +1,63 @@
+==============================================================================
+run started 2026-08-05 07:12:56
+args: {"TEST": null, "bal_tol": 0.03, "batch_size": 10, "distill_dir": "./finetune/data/distill", "distill_gamma": 1.0, "distill_lambda": 1.0, "distill_quiet_cap": 0.33, "drift_high_tol": 0.15, "drift_tol": 0.1, "epochs": 6, "eval_every": 66, "gap_tol": 0.0, "l2sp": 0.001, "lr": 0.0001, "out": "./models/exp3multif0_finetuned_bn_distill_bn.weights.h5", "pos_weight": 4.0, "real_audio": ["./finetune/data/valid/late_dada.wav", "./finetune/data/valid/Parijs_dedetdoe.wav"], "recompute": false, "save_every_epoch": true, "seed": 0, "strategy": "bn", "thresh": 0.5, "train_dir": "./finetune/data/train/", "valid_dir": "./finetune/data/valid/", "weights": "./models/exp3multif0.h5", "win": 50, "win_hop": null}
+==============================================================================
+Output weights: ./models/exp3multif0_finetuned_bn_distill_bn.weights.h5
+Logging to ./models/exp3multif0_finetuned_bn_distill_bn_20260805-071256.log
+Using 6650 cached windows in ./finetune/data/train/_cache
+Using cached features for 2 validation files in ./finetune/data/valid/_cache
+Real-audio drift screen: late_dada.wav (671 frames, 7.8 s)
+Real-audio drift screen: Parijs_dedetdoe.wav (416 frames, 4.8 s)
+Strategy 'bn': 17 trainable layers (17 layers)
+L2-SP anchoring 0 kernels (lambda=0.001)
+baseline     | val_loss bal=0.1149 victim=0.1284  recall bal=0.809 victim=0.783  GAP=0.027  prec bal=0.878 victim=0.878  | quiet recall=0.648 gap=0.161
+Using cached distillation targets in ./finetune/data/distill/_cache
+Distilling on 2729 real windows (26.4 min), lambda=1 gamma=1, edge crop 12 frames
+
+  REAL(2) mean +0.2%  d@high -0.009  r=0.99  worst -0.2%
+  step 66 (epoch 1, batch 66/665)  train_loss=0.1487 distill=0.5457  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000066.weights.h5]  | val_loss bal=0.1162 victim=0.1302  recall bal=0.811 victim=0.784  GAP=0.027  prec bal=0.875 victim=0.875  | quiet recall=0.651 gap=0.160  | REAL(2) mean +0.2%  d@high -0.009  r=0.99  worst -0.2%  [saved best, +0.003 vs baseline]
+
+  REAL(2) mean +1.3%  d@high -0.017  r=0.99  worst +1.1%
+  step 132 (epoch 1, batch 132/665)  train_loss=0.1496 distill=0.5416  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000132.weights.h5]  | val_loss bal=0.1154 victim=0.1293  recall bal=0.813 victim=0.786  GAP=0.027  prec bal=0.874 victim=0.874  | quiet recall=0.649 gap=0.163  | REAL(2) mean +1.3%  d@high -0.017  r=0.99  worst +1.1%  [rejected: gap_quiet 0.163>0.161]
+
+  REAL(2) mean +2.3%  d@high -0.023  r=0.99  worst +2.2%
+  step 198 (epoch 1, batch 198/665)  train_loss=0.1483 distill=0.5433  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000198.weights.h5]  | val_loss bal=0.1142 victim=0.1279  recall bal=0.815 victim=0.788  GAP=0.027  prec bal=0.872 victim=0.872  | quiet recall=0.652 gap=0.163  | REAL(2) mean +2.3%  d@high -0.023  r=0.99  worst +2.2%  [rejected: gap_quiet 0.163>0.161]
+
+  REAL(2) mean +3.3%  d@high -0.029  r=0.99  worst +3.0%
+  step 264 (epoch 1, batch 264/665)  train_loss=0.1399 distill=0.5383  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000264.weights.h5]  | val_loss bal=0.1126 victim=0.1260  recall bal=0.817 victim=0.789  GAP=0.028  prec bal=0.871 victim=0.871  | quiet recall=0.652 gap=0.165  | REAL(2) mean +3.3%  d@high -0.029  r=0.99  worst +3.0%  [rejected: gap_quiet 0.165>0.161]
+
+  REAL(2) mean +3.0%  d@high -0.036  r=0.99  worst +2.6%
+  step 330 (epoch 1, batch 330/665)  train_loss=0.1437 distill=0.5377  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000330.weights.h5]  | val_loss bal=0.1116 victim=0.1250  recall bal=0.818 victim=0.790  GAP=0.028  prec bal=0.872 victim=0.871  | quiet recall=0.651 gap=0.167  | REAL(2) mean +3.0%  d@high -0.036  r=0.99  worst +2.6%  [rejected: gap_quiet 0.167>0.161]
+
+  REAL(2) mean +4.7%  d@high -0.037  r=0.98  worst +4.0%
+  step 396 (epoch 1, batch 396/665)  train_loss=0.1417 distill=0.5393  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000396.weights.h5]  | val_loss bal=0.1099 victim=0.1231  recall bal=0.821 victim=0.793  GAP=0.028  prec bal=0.871 victim=0.871  | quiet recall=0.652 gap=0.169  | REAL(2) mean +4.7%  d@high -0.037  r=0.98  worst +4.0%  [rejected: gap_quiet 0.169>0.161]
+
+  REAL(2) mean +5.0%  d@high -0.043  r=0.98  worst +4.0%
+  step 462 (epoch 1, batch 462/665)  train_loss=0.1413 distill=0.5373  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000462.weights.h5]  | val_loss bal=0.1091 victim=0.1221  recall bal=0.821 victim=0.793  GAP=0.028  prec bal=0.872 victim=0.871  | quiet recall=0.651 gap=0.171  | REAL(2) mean +5.0%  d@high -0.043  r=0.98  worst +4.0%  [rejected: gap_quiet 0.171>0.161]
+
+  REAL(2) mean +6.0%  d@high -0.044  r=0.98  worst +4.7%
+  step 528 (epoch 1, batch 528/665)  train_loss=0.1471 distill=0.5374  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000528.weights.h5]  | val_loss bal=0.1081 victim=0.1209  recall bal=0.823 victim=0.795  GAP=0.029  prec bal=0.872 victim=0.871  | quiet recall=0.651 gap=0.172  | REAL(2) mean +6.0%  d@high -0.044  r=0.98  worst +4.7%  [rejected: gap_quiet 0.172>0.161]
+
+  REAL(2) mean +6.2%  d@high -0.050  r=0.98  worst +4.7%
+  step 594 (epoch 1, batch 594/665)  train_loss=0.1413 distill=0.5360  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000594.weights.h5]  | val_loss bal=0.1070 victim=0.1197  recall bal=0.825 victim=0.796  GAP=0.029  prec bal=0.872 victim=0.871  | quiet recall=0.651 gap=0.174  | REAL(2) mean +6.2%  d@high -0.050  r=0.98  worst +4.7%  [rejected: gap_quiet 0.174>0.161]
+
+  REAL(2) mean +6.5%  d@high -0.053  r=0.98  worst +4.9%
+  step 660 (epoch 1, batch 660/665)  train_loss=0.1408 distill=0.5381  [-> exp3multif0_finetuned_bn_distill_bn_e01_s000660.weights.h5]  | val_loss bal=0.1063 victim=0.1189  recall bal=0.826 victim=0.797  GAP=0.029  prec bal=0.873 victim=0.872  | quiet recall=0.652 gap=0.174  | REAL(2) mean +6.5%  d@high -0.053  r=0.98  worst +4.9%  [rejected: gap_quiet 0.174>0.161]
+
+  REAL(2) mean +6.6%  d@high -0.054  r=0.98  worst +4.9%
+epoch 1/6  train_loss=0.1442 distill=0.5394  [-> exp3multif0_finetuned_bn_distill_bn_e01.weights.h5]  | val_loss bal=0.1062 victim=0.1188  recall bal=0.826 victim=0.797  GAP=0.029  prec bal=0.873 victim=0.872  | quiet recall=0.651 gap=0.175  | REAL(2) mean +6.6%  d@high -0.054  r=0.98  worst +4.9%  [rejected: gap_quiet 0.175>0.161]
+
+  REAL(2) mean +6.4%  d@high -0.056  r=0.98  worst +4.8%
+  step 726 (epoch 2, batch 61/665)  train_loss=0.1306 distill=0.5353  [-> exp3multif0_finetuned_bn_distill_bn_e02_s000726.weights.h5]  | val_loss bal=0.1058 victim=0.1183  recall bal=0.826 victim=0.797  GAP=0.029  prec bal=0.874 victim=0.872  | quiet recall=0.651 gap=0.175  | REAL(2) mean +6.4%  d@high -0.056  r=0.98  worst +4.8%  [rejected: gap_quiet 0.175>0.161]
+
+  REAL(2) mean +7.3%  d@high -0.056  r=0.98  worst +5.6%
+  step 792 (epoch 2, batch 127/665)  train_loss=0.1315 distill=0.5342  [-> exp3multif0_finetuned_bn_distill_bn_e02_s000792.weights.h5]  | val_loss bal=0.1051 victim=0.1175  recall bal=0.827 victim=0.798  GAP=0.029  prec bal=0.874 victim=0.872  | quiet recall=0.652 gap=0.175  | REAL(2) mean +7.3%  d@high -0.056  r=0.98  worst +5.6%  [rejected: gap_quiet 0.175>0.161]
+
+  REAL(2) mean +7.8%  d@high -0.059  r=0.98  worst +5.8%
+  step 858 (epoch 2, batch 193/665)  train_loss=0.1347 distill=0.5355  [-> exp3multif0_finetuned_bn_distill_bn_e02_s000858.weights.h5]  | val_loss bal=0.1043 victim=0.1165  recall bal=0.829 victim=0.800  GAP=0.029  prec bal=0.874 victim=0.873  | quiet recall=0.655 gap=0.174  | REAL(2) mean +7.8%  d@high -0.059  r=0.98  worst +5.8%  [rejected: gap_quiet 0.174>0.161]
+
+  REAL(2) mean +8.3%  d@high -0.062  r=0.98  worst +6.2%
+  step 924 (epoch 2, batch 259/665)  train_loss=0.1316 distill=0.5337  [-> exp3multif0_finetuned_bn_distill_bn_e02_s000924.weights.h5]  | val_loss bal=0.1036 victim=0.1158  recall bal=0.830 victim=0.800  GAP=0.029  prec bal=0.875 victim=0.874  | quiet recall=0.655 gap=0.175  | REAL(2) mean +8.3%  d@high -0.062  r=0.98  worst +6.2%  [rejected: gap_quiet 0.175>0.161]
+
+  REAL(2) mean +8.9%  d@high -0.064  r=0.98  worst +6.5%
+  step 990 (epoch 2, batch 325/665)  train_loss=0.1340 distill=0.5361  [-> exp3multif0_finetuned_bn_distill_bn_e02_s000990.weights.h5]  | val_loss bal=0.1029 victim=0.1149  recall bal=0.832 victim=0.802  GAP=0.029  prec bal=0.875 victim=0.874  | quiet recall=0.655 gap=0.177  | REAL(2) mean +8.9%  d@high -0.064  r=0.98  worst +6.5%  [rejected: gap_quiet 0.177>0.161]
