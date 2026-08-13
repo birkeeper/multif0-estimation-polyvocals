@@ -357,18 +357,35 @@ def build_model(weights_path, strategy):
 
 def make_bkld(pos_weight=1.0):
     """bkld (Brian's KL divergence) loss, optionally upweighting positive
-    (annotated voice) target bins by pos_weight."""
+    (annotated voice) target bins by pos_weight.
+
+    Accepts an optional per-frame `mask` of shape (batch, T): 1 where the label
+    is known, 0 where it is not. Real recordings need this. Inside a chord's
+    attack, release or reverb tail the score cannot distinguish a staggered
+    entry from a decaying voice from a quiet one, so no target is defensible
+    there -- but those frames are still wanted as INPUT, because they feed the
+    receptive field of the frames that are labelled. Masking lets them do that
+    without contributing gradient.
+
+    The mask normalises by its own sum, not by the element count, so a batch of
+    mostly-masked windows is not silently scaled down relative to a full one.
+    """
     eps = 1e-7
     pw = float(pos_weight)
 
-    def loss(y_true, y_pred):
+    def loss(y_true, y_pred, mask=None):
         y_true = tf.clip_by_value(y_true, eps, 1.0 - eps)
         y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
         per = -(y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
         if pw != 1.0:
             w = 1.0 + (pw - 1.0) * tf.cast(y_true > 0.5, per.dtype)
             per = per * w
-        return tf.reduce_mean(per)
+        if mask is None:
+            return tf.reduce_mean(per)
+        # per is (batch, F, T); the mask is per FRAME, so it broadcasts over F
+        m = tf.cast(mask, per.dtype)[:, tf.newaxis, :]
+        denom = tf.reduce_sum(m) * tf.cast(tf.shape(per)[1], per.dtype)
+        return tf.reduce_sum(per * m) / tf.maximum(denom, eps)
 
     return loss
 
@@ -903,9 +920,9 @@ def train(args):
         print("L2-SP anchoring %d kernels (lambda=%g)" % (len(anchors), args.l2sp))
 
     @tf.function
-    def train_step(x1, x2, y, rx1=None, rx2=None, rt=None):
+    def train_step(x1, x2, y, rx1=None, rx2=None, rt=None, ymask=None):
         with tf.GradientTape() as tape:
-            loss_s = loss_fn(y, model([x1, x2], training=True))
+            loss_s = loss_fn(y, model([x1, x2], training=True), ymask)
             loss = loss_s
             loss_r = tf.constant(0.0)
             if rx1 is not None:
@@ -1054,15 +1071,22 @@ def train(args):
             x1 = tf.convert_to_tensor(np.stack([d['mag'] for d in batch]), tf.float32)
             x2 = tf.convert_to_tensor(np.stack([d['dph'] for d in batch]), tf.float32)
             y = tf.convert_to_tensor(np.stack([d['tgt'] for d in batch]), tf.float32)
+            # Windows built by prepare_real_chords.py carry a per-frame mask;
+            # the synthetic ones from prepare() do not, and are fully labelled.
+            ymask = None
+            if all('mask' in d for d in batch):
+                ymask = tf.convert_to_tensor(
+                    np.stack([d['mask'] for d in batch]), tf.float32)
             if next_real is not None:
                 rb = [np.load(p) for p in next_real()]
                 ls, lr = train_step(
                     x1, x2, y,
                     tf.convert_to_tensor(np.stack([d['mag'] for d in rb]), tf.float32),
                     tf.convert_to_tensor(np.stack([d['dph'] for d in rb]), tf.float32),
-                    tf.convert_to_tensor(np.stack([d['tsal'] for d in rb]), tf.float32))
+                    tf.convert_to_tensor(np.stack([d['tsal'] for d in rb]), tf.float32),
+                    ymask)
             else:
-                ls, lr = train_step(x1, x2, y)
+                ls, lr = train_step(x1, x2, y, ymask=ymask)
             losses.append((float(ls), float(lr)))
             since_eval.append(losses[-1])
             step += 1

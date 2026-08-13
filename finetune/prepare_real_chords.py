@@ -192,12 +192,25 @@ def _ylim_fundamentals(freqs, margin=1.12):
 
 
 def plot_take_overview(energy, chords, spans, fit, tune, cents, title, out_png,
-                       n_harm=2):
+                       n_harm=2, state=None):
     """Whole take: chord extent as fitted, the trimmed part actually used, and
-    the corrected label frequencies drawn over the energy."""
+    the corrected label frequencies drawn over the energy.
+
+    With `state` the three label regions are shaded along the bottom, which is
+    the thing to check: green where the chord's pitches are asserted, grey where
+    nothing is (attack, release, reverb tail), blue where silence is asserted.
+    """
     all_f = [f for _t0, _t1, fr in chords for f in fr]
     fig, ax = plt.subplots(figsize=(16, 7))
     _specshow(ax, energy)
+
+    if state is not None:
+        lo = min(all_f) / 1.55
+        band = lo * 1.06
+        t = np.arange(len(state)) * HOP / SR
+        for val, colour in ((1, 'lime'), (2, 'deepskyblue'), (0, 'grey')):
+            ax.fill_between(t, lo, band, where=(state == val), step='mid',
+                            color=colour, alpha=0.85, linewidth=0)
 
     for ci, ((t0, t1, _fr), (i0, i1, cfr)) in enumerate(zip(chords, spans)):
         a0, a1 = fit['scale'] * t0 + fit['offset'], fit['scale'] * t1 + fit['offset']
@@ -217,6 +230,10 @@ def plot_take_overview(energy, chords, spans, fit, tune, cents, title, out_png,
     handles = [plt.Line2D([], [], color='cyan', ls='--', label='matched chord start/end'),
                plt.Line2D([], [], color='lime', lw=6, alpha=0.3, label='trimmed (used)'),
                plt.Line2D([], [], color='lime', lw=2, label='label freq (tuning-corrected)')]
+    if state is not None:
+        handles += [plt.Line2D([], [], color='lime', lw=6, label='supervised: chord'),
+                    plt.Line2D([], [], color='deepskyblue', lw=6, label='supervised: silence'),
+                    plt.Line2D([], [], color='grey', lw=6, label='masked (no gradient)')]
     ax.legend(handles=handles, loc='upper right', fontsize=8, framealpha=0.7)
     fig.tight_layout()
     fig.savefig(out_png, dpi=110)
@@ -364,10 +381,23 @@ def main(args):
 
     # Split BY TAKE. Deterministic given --seed so a rerun reproduces the split.
     rng = np.random.RandomState(args.seed)
-    if args.valid_songs:
+    if args.valid_takes:
+        want = {t.lower() for t in args.valid_takes}
+        in_valid = [t.lower() in want for _a, _m, _s, t in pairs]
+        missing = want - {t.lower() for _a, _m, _s, t in pairs}
+        for m in sorted(missing):
+            print("  ! --valid_takes '%s' matches no take" % m)
+    elif args.valid_songs:
         vs = set(args.valid_songs)
         in_valid = [song in vs for _a, _m, song, _t in pairs]
+    elif args.valid_take_frac <= 0.0:
+        # An explicit 0 means "training material only" -- e.g. building the set
+        # up take by take, or holding out a whole song separately. The floor
+        # below must not override it.
+        in_valid = [False] * len(pairs)
     else:
+        # At least one take, so a small --valid_take_frac cannot silently round
+        # down to an empty validation set.
         n_valid = max(1, int(round(args.valid_take_frac * len(pairs))))
         pick = set(rng.permutation(len(pairs))[:n_valid].tolist())
         in_valid = [i in pick for i in range(len(pairs))]
@@ -384,14 +414,28 @@ def main(args):
     trim = args.trim_ms / 1000.0
     hop = args.win_hop or args.win
     manifest, n_written = [], {'train': 0, 'valid': 0}
+    processed_takes = set()
 
     print("\n%d take(s), measures %d-%d, trim %.0f ms/end, win %d frames\n"
           % (len(pairs), m_from, m_to, args.trim_ms, args.win))
 
     for pi, (wav, mid, song, take) in enumerate(pairs):
         split = 'valid' if in_valid[pi] else 'train'
+        processed_takes.add(take)
         print("[%s] %-40s score=%s" % (split, os.path.basename(wav)[:40],
                                        os.path.basename(mid)))
+
+        # Drop this take's windows from BOTH splits before rewriting them. A
+        # re-run with different settings can produce fewer windows than before,
+        # and the leftovers would otherwise stay in the training set carrying
+        # labels built under the old settings. Both splits, because a take can
+        # move between them.
+        stale = sum((glob.glob(os.path.join(d, '%s_w*.npz' % take))
+                     for d in out_dirs.values()), [])
+        for f in stale:
+            os.remove(f)
+        if stale:
+            print("    removed %d window(s) from a previous run" % len(stale))
 
         chords_raw = read_blocked_chords(mid, m_from, m_to, args.bpm,
                                          beats_per_measure=args.beats_per_measure,
@@ -422,6 +466,29 @@ def main(args):
         if res is None:
             print("    ! alignment/tuning failed -- take skipped\n")
             continue
+
+        # A take that stops part-way through the passage leaves score chords with
+        # no audio to correlate against, which drags `r` down and makes a
+        # correctly-aligned take look misaligned. Drop the chords that fall off
+        # the end and refit on what is actually present.
+        dur = T * HOP / SR
+        inside = [c for c in chords
+                  if res['fit']['scale'] * c[0] + res['fit']['offset'] < dur - 0.05]
+        if len(inside) < len(chords):
+            print("    %d of %d chords fall beyond the audio (%.2f s) -- refitting "
+                  "on the rest" % (len(chords) - len(inside), len(chords), dur))
+            chords = inside
+            chords_raw = chords_raw[:len(inside)]
+            if not chords:
+                print("    ! no chord inside the audio -- take skipped\n")
+                continue
+            res = align_and_tune(mag, fgrid, tgrid, chords,
+                                 scales=tuple(args.scale_range),
+                                 offsets=tuple(args.offset_range))
+            if res is None:
+                print("    ! refit failed -- take skipped\n")
+                continue
+
         fit, tune = res['fit'], res['tune']
         cents = tune['cents'] if args.tuning_mode != 'none' else 0.0
         print("    time  : scale=%.3f offset=%+.3f r=%.3f%s"
@@ -442,9 +509,71 @@ def main(args):
         spans = chord_spans(chords, fit['scale'], fit['offset'], T,
                             trim_s=trim, cents=cents)
 
+        # ---- label the TIMELINE, then window the timeline --------------------
+        #
+        # Not per chord. A window is allowed to straddle a chord boundary,
+        # because the neighbouring chord's frames have known labels too, and
+        # because at inference the model sees exactly that -- continuous audio
+        # in which a frame near a boundary has the next chord inside its
+        # receptive field. Windowing within chords would instead force the
+        # model to learn from zero-padded context it never meets in use.
+        #
+        # Every frame gets one of three states:
+        #   SUPERVISED, chord   -- inside a trimmed sustain: that chord's pitches
+        #   MASKED              -- attack, release, reverb tail: the score cannot
+        #                          distinguish a staggered entry from a decaying
+        #                          voice from a quiet one, so nothing is asserted
+        #   SUPERVISED, silence -- deep inside a rest, past the reverb margin
+        #
+        # The masked frames are not wasted: they still feed the receptive field
+        # of the supervised frames around them. They simply earn no gradient.
+        mask = np.zeros(T, dtype=np.float32)
+        state = np.zeros(T, dtype=np.int8)          # 0 mask, 1 chord, 2 silence
+        pts_t, pts_f = [], []
+        for ci, (i0, i1, freqs) in enumerate(spans):
+            if i1 <= i0:
+                continue
+            mask[i0:i1] = 1.0
+            state[i0:i1] = 1
+            for i in range(i0, i1):
+                for f in freqs:
+                    pts_t.append(tgrid[i])
+                    pts_f.append(f)
+
+        # Deep rest: between one chord's untrimmed release and the next chord's
+        # untrimmed attack, minus a margin for the reverb tail. Without these
+        # negatives every supervised frame would contain sounding voices and
+        # nothing in the loss would ever say "no voice here".
+        rest_margin = int(round(args.rest_margin_ms / 1000.0 * SR / HOP))
+        n_rest = 0
+        if not args.no_rest_negatives:
+            bounds = []
+            for (t0, t1, _f) in chords:
+                bounds.append((int(np.floor((fit['scale'] * t0 + fit['offset']) * SR / HOP)),
+                               int(np.ceil((fit['scale'] * t1 + fit['offset']) * SR / HOP))))
+            for k in range(len(bounds) + 1):
+                lo = 0 if k == 0 else bounds[k - 1][1] + rest_margin
+                hi = T if k == len(bounds) else bounds[k][0] - rest_margin
+                lo, hi = max(lo, 0), min(hi, T)
+                if hi - lo >= args.min_rest_frames:
+                    mask[lo:hi] = 1.0
+                    state[lo:hi] = 2
+                    n_rest += hi - lo
+
+        target = utils.create_annotation_target(
+            fgrid, tgrid, np.array(pts_t), np.array(pts_f)).astype(np.float32) \
+            if pts_t else np.zeros((len(fgrid), T), dtype=np.float32)
+        target[:, state != 1] = 0.0        # silence frames are genuinely zero
+
+        n_chord = int((state == 1).sum())
+        print("    timeline: %d supervised frames (%d chord, %d silence), "
+              "%d masked (%.0f%%)"
+              % (int(mask.sum()), n_chord, n_rest, T - int(mask.sum()),
+                 100.0 * (T - mask.sum()) / max(1, T)))
+
         # Plot BEFORE the gates, and label the picture with the verdict: a take
         # that was rejected is exactly the one worth looking at, and a picture
-        # only of the takes that passed cannot show you why the others did not.
+        # only of the takes that passed cannot show why the others were not.
         reason = ''
         if fit['r'] < args.min_align_r:
             reason = 'REJECTED: align r %.3f < %.2f' % (fit['r'], args.min_align_r)
@@ -452,6 +581,8 @@ def main(args):
               and tune['prominence'] < args.min_tuning_prominence):
             reason = ('REJECTED: tuning prominence %.3f < %.2f'
                       % (tune['prominence'], args.min_tuning_prominence))
+        elif n_chord == 0:
+            reason = 'REJECTED: no supervised chord frames'
 
         if not args.no_plots:
             title = ("%s [%s]  scale=%.3f offset=%+.3f r=%.3f | tuning %+.1f c "
@@ -461,7 +592,7 @@ def main(args):
                         args.trim_ms, reason))
             plot_take_overview(res['energy'], chords, spans, fit, tune, cents,
                                title, os.path.join(plot_dir, '%s_overview.png' % take),
-                               args.plot_harmonics)
+                               args.plot_harmonics, state=state)
             plot_chord_details(res['energy'], chords, spans, fit, cents, title,
                                os.path.join(plot_dir, '%s_chords.png' % take),
                                args.plot_harmonics)
@@ -473,90 +604,97 @@ def main(args):
             print("    ! %s -- take skipped (see plot)\n" % reason)
             continue
 
-        usable, short = [], []
-        for ci, (i0, i1, freqs) in enumerate(spans):
-            if i1 - i0 < args.win:
-                short.append((ci, max(0, i1 - i0)))
+        # ---- slide windows across the whole file ----
+        min_sup = (args.min_supervised if args.min_supervised is not None
+                   else max(1, int(round(0.25 * args.win))))
+        fw, kept_chords = 0, set()
+        for s in range(0, max(1, T - args.win + 1), hop):
+            m = mask[s:s + args.win]
+            if m.sum() < min_sup:
                 continue
-            usable.append((ci, i0, i1, freqs))
-        # Chord numbers here, in the manifest, in the filenames and in the plots
-        # are all 1-based and refer to the same chord.
-        if short:
-            best = max(n for _c, n in short)
-            print("    dropped (< --win %d): %s"
-                  % (args.win, ', '.join('chord %d = %d frames' % (c + 1, n)
-                                         for c, n in short)))
-            if best >= 8:
-                print("      (--win %d would keep the longest of them)" % best)
-        if usable:
-            print("    kept: %s"
-                  % ', '.join('chord %d = %d frames' % (c + 1, b - a)
-                              for c, a, b, _f in usable))
-        if not usable:
-            print("    ! no chord long enough -- take skipped\n")
-            continue
-
-        # ---- target built once over the whole file, then sliced ----
-        pts_t, pts_f = [], []
-        for _ci, i0, i1, freqs in usable:
-            for i in range(i0, i1):
-                for f in freqs:
-                    pts_t.append(tgrid[i])
-                    pts_f.append(f)
-        target = utils.create_annotation_target(
-            fgrid, tgrid, np.array(pts_t), np.array(pts_f)).astype(np.float32)
-
-        n_take = 0
-        for ci, i0, i1, freqs in usable:
-            pitches = [p for _v, p in chords_raw[ci][2]]
-            fw = 0
-            for s in range(i0, i1 - args.win + 1, hop):
-                np.savez_compressed(
-                    os.path.join(out_dirs[split],
-                                 '%s_c%04d_w%04d.npz' % (take, ci + 1, fw)),
-                    mag=np.transpose(mag[:, :, s:s + args.win], (1, 2, 0)),
-                    dph=np.transpose(dph[:, :, s:s + args.win], (1, 2, 0)),
-                    tgt=target[:, s:s + args.win],
-                    song=song, take=take, chord=ci + 1, cents=cents,
-                    pitches=np.array(pitches))
-                fw += 1
-            n_take += fw
-            n_written[split] += fw
-            manifest.append(dict(
-                split=split, song=song, take=take, chord=ci + 1,
-                pitches=' '.join(note_name(p) for p in pitches),
-                i0=i0, i1=i1, frames=i1 - i0, windows=fw,
-                cents=round(cents, 1), tuning_prominence=round(tune['prominence'], 3),
-                scale=fit['scale'], offset=round(fit['offset'], 3),
-                align_r=round(fit['r'], 3)))
-        print("    kept %d/%d chords -> %d windows\n"
-              % (len(usable), len(chords), n_take))
+            st = state[s:s + args.win]
+            in_win = sorted({ci + 1 for ci, (i0, i1, _f) in enumerate(spans)
+                             if i1 > i0 and i0 < s + args.win and i1 > s})
+            kept_chords.update(in_win)
+            np.savez_compressed(
+                os.path.join(out_dirs[split], '%s_w%05d.npz' % (take, fw)),
+                mag=np.transpose(mag[:, :, s:s + args.win], (1, 2, 0)),
+                dph=np.transpose(dph[:, :, s:s + args.win], (1, 2, 0)),
+                tgt=target[:, s:s + args.win],
+                mask=m.copy(),
+                song=song, take=take, cents=cents, start=s,
+                n_supervised=int(m.sum()), n_chord=int((st == 1).sum()),
+                n_silence=int((st == 2).sum()),
+                chords=np.array(in_win, dtype=np.int32))
+            fw += 1
+        n_written[split] += fw
+        manifest.append(dict(
+            split=split, song=song, take=take, frames=T, windows=fw,
+            chords_total=len(chords), chords_covered=len(kept_chords),
+            sup_chord=n_chord, sup_silence=n_rest,
+            masked=T - int(mask.sum()),
+            cents=round(cents, 1), tuning_prominence=round(tune['prominence'], 3),
+            scale=fit['scale'], offset=round(fit['offset'], 3),
+            align_r=round(fit['r'], 3)))
+        print("    %d windows (>= %d supervised frames each), covering %d/%d chords\n"
+              % (fw, min_sup, len(kept_chords), len(chords)))
 
     if not manifest:
         raise SystemExit("Nothing written. Loosen --min_align_r / "
                          "--min_tuning_prominence, or check --measures.")
 
+    # The manifest describes the OUTPUT DIRECTORY, not this invocation. Takes are
+    # usually added a few at a time, so rows for takes this run did not touch are
+    # carried over; rows for takes it did touch are replaced, which keeps a
+    # re-run idempotent instead of duplicating them.
     mpath = os.path.join(args.out, 'manifest.csv')
+    fields = list(manifest[0].keys())
+    carried = []
+    if os.path.exists(mpath):
+        try:
+            with open(mpath) as fh:
+                old = list(csv.DictReader(fh))
+        except (IOError, csv.Error):
+            old = []
+        if old and set(old[0].keys()) != set(fields):
+            print("! existing manifest has different columns (older script "
+                  "version) -- it is being replaced, not merged")
+        else:
+            carried = [r for r in old if r.get('take') not in processed_takes]
     with open(mpath, 'w') as fh:
-        w = csv.DictWriter(fh, fieldnames=list(manifest[0].keys()))
+        w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
+        w.writerows(carried)
         w.writerows(manifest)
+    if carried:
+        print("manifest: %d row(s) carried over from previous runs" % len(carried))
     # DONE markers so finetune.prepare() reuses these instead of re-slicing
     for d in out_dirs.values():
         open(os.path.join(d, 'DONE'), 'w').close()
 
-    takes = {s: len({m['take'] for m in manifest if m['split'] == s})
-             for s in ('train', 'valid')}
-    secs = sum(n_written.values()) * args.win * HOP / SR
+    # Report the DIRECTORY, not just this run -- the manifest now spans both, and
+    # a summary describing only the current invocation would contradict it. The
+    # window counts are read off disk, so they cannot drift from reality.
     print("=" * 66)
-    print("train %d windows (%d takes)   valid %d windows (%d takes)"
-          % (n_written['train'], takes['train'], n_written['valid'], takes['valid']))
-    print("%.1f s of labelled sustained real audio" % secs)
-    print("tuning applied: %+.1f .. %+.1f cents"
-          % (min(m['cents'] for m in manifest), max(m['cents'] for m in manifest)))
-    print("manifest: %s" % mpath)
-    if takes['valid'] == 0:
+    print("this run: %d take(s), %d window(s)"
+          % (len(processed_takes), sum(n_written.values())))
+    all_rows = carried + [{k: str(v) for k, v in m.items()} for m in manifest]
+    on_disk = {s: len(glob.glob(os.path.join(out_dirs[s], '*_w*.npz')))
+               for s in ('train', 'valid')}
+    takes = {s: len({r['take'] for r in all_rows if r['split'] == s})
+             for s in ('train', 'valid')}
+    secs = sum(on_disk.values()) * args.win * HOP / SR
+    print("in %s:" % args.out)
+    print("  train %4d windows (%d takes)   valid %4d windows (%d takes)"
+          % (on_disk['train'], takes['train'], on_disk['valid'], takes['valid']))
+    print("  %.1f s of labelled sustained real audio" % secs)
+    cents_all = [float(r['cents']) for r in all_rows]
+    print("  tuning applied: %+.1f .. %+.1f cents" % (min(cents_all), max(cents_all)))
+    print("manifest: %s (%d rows)" % (mpath, len(all_rows)))
+    if takes['valid'] == 0 and args.valid_take_frac > 0 and not args.valid_takes:
         print("! no validation takes -- raise --valid_take_frac")
+    elif takes['valid'] == 0:
+        print("(training material only, as requested -- no validation takes)")
 
 
 if __name__ == '__main__':
@@ -592,11 +730,31 @@ if __name__ == '__main__':
     p.add_argument('--win', type=int, default=50, help='window frames (matches finetune.py)')
     p.add_argument('--win_hop', type=int, default=None,
                    help='window stride (default --win, no overlap)')
+    p.add_argument('--min_supervised', type=int, default=None,
+                   help='a window is written only if at least this many of its '
+                        'frames are supervised (default 25%% of --win). Windows '
+                        'may straddle chord boundaries -- that is the point, it '
+                        'is what the model sees at inference -- so this only '
+                        'discards windows that are almost entirely mask.')
+    p.add_argument('--rest_margin_ms', type=float, default=250.0,
+                   help='how long after a chord releases before silence is '
+                        'trusted as silence (default 250). Covers the reverb '
+                        'tail: labelling a ringing chord as silent would teach '
+                        'the model to suppress it.')
+    p.add_argument('--min_rest_frames', type=int, default=6,
+                   help='ignore rests shorter than this many frames once the '
+                        'reverb margin is removed (default 6)')
+    p.add_argument('--no_rest_negatives', action='store_true',
+                   help='do not supervise the rests. NOT recommended: without '
+                        'them every supervised frame contains sounding voices, '
+                        'so nothing in the loss ever says "no voice here" -- the '
+                        'same missing counterweight that let --pos_weight 4 '
+                        'inflate salience by 55%%.')
 
     p.add_argument('--tuning_mode', choices=['per_take', 'none'], default='per_take',
                    help="'per_take' (default) measures the choir's offset and "
                         "shifts the LABEL frequencies onto it. 'none' trusts A440 "
-                        "-- only safe if you have verified the choir is within "
+                        "-- only safe if you have vr=%erified the choir is within "
                         "~10 cents, since sigma is 20 cents.")
     p.add_argument('--min_tuning_prominence', type=float, default=0.05,
                    help='skip a take whose tuning correlation peak is flatter than '
@@ -637,5 +795,10 @@ if __name__ == '__main__':
                         'performance already seen measure memorisation.')
     p.add_argument('--valid_songs', nargs='+', default=None,
                    help='hold out these songs entirely instead of sampling takes')
+    p.add_argument('--valid_takes', nargs='+', default=None, metavar='TAKE',
+                   help='hold out these takes by name (the wav stem, e.g. '
+                        'late_take03). Takes precedence over --valid_songs and '
+                        '--valid_take_frac. Use this when every take is the same '
+                        'song, where --valid_songs cannot split anything.')
     p.add_argument('--seed', type=int, default=0)
     main(p.parse_args())
