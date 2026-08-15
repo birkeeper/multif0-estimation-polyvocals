@@ -249,6 +249,15 @@ def segment_chords(target, gap_frames=8, min_frames=12):
 # --------------------------------------------------------------------------
 # Prepare: featurize + slice chords + cache to disk (one npz per chord)
 # --------------------------------------------------------------------------
+def is_prebuilt_cache(d):
+    """True if `d` is itself a finished window cache (DONE marker + *.npz
+    sitting directly in it), as prepare_real_chords.py writes -- as opposed to
+    a raw source dir (train_*.wav/.f0.csv, or valid_*_balanced/victim.wav)
+    that still needs featurizing."""
+    return (os.path.exists(os.path.join(d, 'DONE'))
+            and bool(glob.glob(os.path.join(d, '*.npz'))))
+
+
 def prepare(pump, train_dir, cache_dir, win=50, hop=None, recompute=False):
     """Featurize each file, slice chords, cut chords into fixed `win`-frame
     windows (stride `hop`, default `win` = no overlap), cache one npz per
@@ -258,6 +267,15 @@ def prepare(pump, train_dir, cache_dir, win=50, hop=None, recompute=False):
     Window files are named <stem>_c<chord>_w<window>.npz so a subset of chords
     can be selected later (see --TEST) without reading the files."""
     hop = hop or win
+    # Windows built directly by prepare_real_chords.py (or any other prebuilt
+    # cache) sit as DONE + *.npz in train_dir itself -- no _cache subfolder,
+    # and no .f0.csv to reslice from. Use them as-is when present.
+    prebuilt = is_prebuilt_cache(train_dir)
+    if prebuilt:
+        wins = sorted(glob.glob(os.path.join(train_dir, '*.npz')))
+        print("Using %d prebuilt windows in %s" % (len(wins), train_dir))
+        return wins
+
     os.makedirs(cache_dir, exist_ok=True)
     done_marker = os.path.join(cache_dir, 'DONE')
     if os.path.exists(done_marker) and not recompute:
@@ -301,12 +319,21 @@ _CHORD_RE = re.compile(r'_c(\d+)_w\d+\.npz$')
 
 
 def select_first_chords(win_files, n_chords):
-    """Keep only windows belonging to the first `n_chords` chords OF EACH FILE
-    (chord index is encoded in the filename by prepare())."""
+    """Keep only windows belonging to the first `n_chords` chords OF EACH FILE.
+    prepare()'s synthetic windows carry the chord index in the filename;
+    prepare_real_chords.py's windows have no such suffix (a sliding window can
+    straddle several chords) but store the chord indices it covers in the
+    npz's `chords` field instead, 1-based."""
     kept = []
     for p in win_files:
         m = _CHORD_RE.search(os.path.basename(p))
-        if m is not None and int(m.group(1)) < n_chords:
+        if m is not None:
+            if int(m.group(1)) < n_chords:
+                kept.append(p)
+            continue
+        with np.load(p) as d:
+            chords = d['chords'] if 'chords' in d.files else None
+        if chords is not None and len(chords) and int(chords.min()) <= n_chords:
             kept.append(p)
     return kept
 
@@ -752,6 +779,73 @@ def evaluate_invariance(model, valid_dir, cache_dir, thresh, loss_fn, n_chords=N
                 loss_balanced=np.mean(lb), loss_victim=np.mean(lv))
 
 
+def evaluate_real(model, valid_dir, thresh, loss_fn, n_chords=None):
+    """Validate directly on real-audio windows (mag/dph/tgt/mask), as cached by
+    prepare_real_chords.py in valid_dir -- one npz per window, already fixed
+    length, no whole-file cache and no wav to re-featurize.
+
+    Real single-take recordings have no matched balanced/victim pair (there is
+    no quiet-one-voice render of the same performance), so there is no
+    invariance gap to measure here. This instead reports plain recall/
+    precision/loss over the SUPERVISED frames only (mask == 1): the score-
+    derived attack/release/reverb margins that prepare_real_chords.py masked
+    out have no defensible target, and scoring them would just add noise to
+    the comparison against baseline."""
+    import mir_eval
+    wins = sorted(glob.glob(os.path.join(valid_dir, '*.npz')))
+    if n_chords is not None:
+        wins = select_first_chords(wins, n_chords)
+    if not wins:
+        return None
+    recalls, precisions, losses = [], [], []
+    for p in wins:
+        with np.load(p) as d:
+            mag, dph, tgt, mask = d['mag'], d['dph'], d['tgt'], d['mask']
+        if mask.sum() == 0:
+            continue
+        sal = model.predict([mag[np.newaxis], dph[np.newaxis]], verbose=0)[0]
+        loss = float(loss_fn(tf.constant(tgt[np.newaxis]), tf.constant(sal[np.newaxis]),
+                             tf.constant(mask[np.newaxis].astype(np.float32))))
+        losses.append(loss)
+
+        times = utils.get_time_grid(mask.shape[0])
+        freq_grid = utils.get_freq_grid()
+        _, est_freqs = utils_train.pitch_activations_to_mf0(sal, thresh)
+        ref_freqs = [freq_grid[tgt[:, t] > 0.5] for t in range(mask.shape[0])]
+        idx = np.where(mask > 0.5)[0]
+        m = mir_eval.multipitch.evaluate(times[idx], [ref_freqs[i] for i in idx],
+                                         times[idx], [est_freqs[i] for i in idx])
+        recalls.append(m['Recall']); precisions.append(m['Precision'])
+    if not recalls:
+        return None
+    return dict(recall=np.mean(recalls), precision=np.mean(precisions),
+                loss=np.mean(losses))
+
+
+def guard_failures_real(inv, baseline, args):
+    """Real-audio counterpart of guard_failures(): no balanced/victim sides or
+    invariance gap to guard here, just recall/precision vs. the pre-training
+    baseline, plus the same real-audio drift screen (only present when
+    --real_audio was given, same as guard_failures())."""
+    if baseline is None:
+        return []
+    failed = []
+    for key in ('recall', 'precision'):
+        if inv[key] < baseline[key] - args.bal_tol:
+            failed.append("%s %.3f<%.3f" % (key, inv[key], baseline[key] - args.bal_tol))
+    if 'real_rel_mean' in inv:
+        if inv['real_worst'] < -args.drift_tol:
+            failed.append("real mean %+.0f%%" % (100 * inv['real_worst']))
+        if inv['real_d_high'] < -args.drift_high_tol:
+            failed.append("real d@high %.3f" % inv['real_d_high'])
+    return failed
+
+
+def format_metrics_real(m):
+    return ("val_loss=%.4f  recall=%.3f  precision=%.3f"
+            % (m['loss'], m['recall'], m['precision']))
+
+
 # --------------------------------------------------------------------------
 # Real-audio drift screen (no annotation required)
 # --------------------------------------------------------------------------
@@ -886,12 +980,17 @@ def train(args):
         print("--TEST: first %d chord(s) per file -> %d of %d windows"
               % (args.TEST, len(win_files), n_all))
 
+    # Real-audio validation windows (prepare_real_chords.py) are already fully
+    # featurized, fixed-length npz sitting directly in valid_dir -- there is no
+    # whole-file cache to build and no balanced/victim pair to match, so that
+    # whole prepare_valid() step is skipped for them.
     valid_cache_dir = None
-    if args.valid_dir:
+    real_valid = args.valid_dir and is_prebuilt_cache(args.valid_dir)
+    if args.valid_dir and not real_valid:
         valid_cache_dir = os.path.join(args.valid_dir, '_cache')
         prepare_valid(pump, args.valid_dir, valid_cache_dir, recompute=args.recompute)
-        if args.TEST is not None:
-            print("--TEST: validating on the first %d chord(s) of each file" % args.TEST)
+    if args.valid_dir and args.TEST is not None:
+        print("--TEST: validating on the first %d chord(s) of each file" % args.TEST)
 
     # Real-audio drift screen: featurise once, up front. A few seconds is plenty
     # -- this is a distribution check, not an accuracy measurement.
@@ -943,10 +1042,17 @@ def train(args):
         return loss_s, loss_r
 
     # Pre-training baseline so we can require the other metrics not to regress.
-    baseline = evaluate_invariance(model, args.valid_dir, valid_cache_dir, args.thresh,
-                                   loss_fn, n_chords=args.TEST) if args.valid_dir else None
+    if real_valid:
+        baseline = evaluate_real(model, args.valid_dir, args.thresh, loss_fn,
+                                 n_chords=args.TEST)
+    elif args.valid_dir:
+        baseline = evaluate_invariance(model, args.valid_dir, valid_cache_dir, args.thresh,
+                                       loss_fn, n_chords=args.TEST)
+    else:
+        baseline = None
     if baseline is not None:
-        print("baseline     | " + format_metrics(baseline))
+        print("baseline     | " + (format_metrics_real(baseline) if real_valid
+                                   else format_metrics(baseline)))
 
     # Pre-training salience on the real excerpt: the reference every epoch is
     # compared against. Taken from the untouched weights, so it is the model's
@@ -1004,7 +1110,10 @@ def train(args):
     # than baseline on the objective still passes them; starting from None meant
     # the first such checkpoint was written to --out unconditionally and the run
     # could ship a model worse than the one it started from.
-    state = dict(best_quiet=baseline['recall_quiet'] if baseline else None,
+    # Real-audio validation has no invariance gap to target, so it ranks
+    # checkpoints on plain recall instead of the undiluted quiet-voice figure.
+    rank_key = 'recall' if real_valid else 'recall_quiet'
+    state = dict(best_rank=baseline[rank_key] if baseline else None,
                  saved=None)
     history = []
 
@@ -1034,24 +1143,31 @@ def train(args):
             print("  " + format_drift(drift))
 
         if args.valid_dir:
-            inv = evaluate_invariance(model, args.valid_dir, valid_cache_dir, args.thresh,
-                                      loss_fn, n_chords=args.TEST)
+            if real_valid:
+                inv = evaluate_real(model, args.valid_dir, args.thresh, loss_fn,
+                                    n_chords=args.TEST)
+            else:
+                inv = evaluate_invariance(model, args.valid_dir, valid_cache_dir, args.thresh,
+                                          loss_fn, n_chords=args.TEST)
             if inv is not None:
                 inv.update(drift)
                 history.append(dict(tag=tag, **inv))
-                msg += "  | " + format_metrics(inv)
+                msg += "  | " + (format_metrics_real(inv) if real_valid
+                                 else format_metrics(inv))
                 if drift:
                     msg += "  | " + format_drift(drift)
-                # Rank checkpoints on the UNDILUTED quiet-voice recall (the actual
-                # objective), and refuse any that pays for it by regressing
-                # recall or precision on either side, or by widening the gap.
-                failed = guard_failures(inv, baseline, args)
+                # Rank checkpoints on the UNDILUTED quiet-voice recall for synthetic
+                # validation (the actual objective there), or plain recall for real
+                # validation, and refuse any that pays for it by regressing recall
+                # or precision (both sides, for synthetic), or by widening the gap.
+                failed = (guard_failures_real(inv, baseline, args) if real_valid
+                         else guard_failures(inv, baseline, args))
                 if failed:
                     msg += "  [rejected: %s]" % ", ".join(failed)
-                elif state['best_quiet'] is None or inv['recall_quiet'] > state['best_quiet']:
+                elif state['best_rank'] is None or inv[rank_key] > state['best_rank']:
                     improved = (baseline is None or
-                                inv['recall_quiet'] - baseline['recall_quiet'])
-                    state['best_quiet'] = inv['recall_quiet']
+                                inv[rank_key] - baseline[rank_key])
+                    state['best_rank'] = inv[rank_key]
                     state['saved'] = tag
                     model.save_weights(args.out)
                     msg += ("  [saved best%s]" % ('' if baseline is None
@@ -1109,6 +1225,7 @@ def train(args):
                "epoch %d/%d  %s"
                % (epoch + 1, args.epochs,
                   format_train_loss(losses, next_real is not None)))
+    rank_label = 'recall' if real_valid else 'quiet-voice recall'
     if not args.valid_dir:
         print("Saved final weights to %s" % args.out)
     elif state['saved'] is None:
@@ -1116,27 +1233,34 @@ def train(args):
         # the pre-trained model on the objective, so writing anything to --out
         # would ship a regression under a name that implies an improvement. The
         # per-checkpoint files are still on disk if the run is worth salvaging.
-        print("No checkpoint beat the baseline quiet-voice recall (%.3f) within "
+        print("No checkpoint beat the baseline %s (%.3f) within "
               "the guards; %s NOT written -- use %s instead."
-              % (state['best_quiet'], args.out, os.path.basename(args.weights)))
+              % (rank_label, state['best_rank'], args.out, os.path.basename(args.weights)))
     else:
-        print("Best (highest quiet-voice recall, guards satisfied) weights saved "
-              "to %s -- from %s, quiet recall %.3f vs baseline %.3f"
-              % (args.out, state['saved'], state['best_quiet'],
-                 baseline['recall_quiet']))
+        print("Best (highest %s, guards satisfied) weights saved "
+              "to %s -- from %s, %s %.3f vs baseline %.3f"
+              % (rank_label, args.out, state['saved'], rank_label, state['best_rank'],
+                 baseline[rank_key]))
 
     if history:
         print("\ncheckpoint summary")
         w = max(len(h['tag']) for h in history)
+        fmt = format_metrics_real if real_valid else format_metrics
         for h in history:
-            print("  %-*s | %s" % (w, h['tag'], format_metrics(h)))
+            print("  %-*s | %s" % (w, h['tag'], fmt(h)))
 
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--train_dir', required=True, help='dir with train_*.wav + .f0.csv')
-    p.add_argument('--valid_dir', default=None, help='dir with the matched valid pairs')
+    p.add_argument('--train_dir', required=True,
+                   help='dir with train_*.wav + .f0.csv, OR a prebuilt window '
+                        'cache (DONE + *.npz directly in the dir) such as '
+                        'prepare_real_chords.py writes')
+    p.add_argument('--valid_dir', default=None,
+                   help='dir with the matched valid_*_balanced/victim pairs, OR '
+                        'a prebuilt real-audio window cache (DONE + *.npz), same '
+                        'as --train_dir')
     p.add_argument('--weights', default='./models/exp3multif0.h5',
                    help='model3 weights to fine-tune from')
     p.add_argument('--out', default='./models/exp3multif0_finetuned.weights.h5',

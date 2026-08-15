@@ -175,12 +175,62 @@ def fit_time(energy, fgrid, tgrid, chords, scales, offsets, cents=0.0,
                          abs(off - offsets[0]) < 1e-9 or abs(off - offsets[-1]) < 1e-9))
 
 
+def alignment_quality(energy, fgrid, spans, tol_cents=80.0):
+    """How well the score's pitches explain the energy AT THE TIMES IT CLAIMS.
+
+    `fit_time`'s own `r` is computed over the whole image, so it is penalised by
+    COVERAGE: a score that only claims 0.262 s out of every 1.6 s -- which is
+    what a fixed MIDI gate time produces -- leaves most of the energy sitting at
+    mask=0 and scores low however well it is aligned. That made correctly
+    aligned takes look misaligned (late_take01: r = 0.220).
+
+    Restricting the correlation to the frames the score makes a claim about asks
+    the question that actually matters -- "at these instants, is the energy at
+    the named pitches?" -- and is indifferent to how much of the timeline the
+    score covers, so it is comparable across scores with different conventions.
+    """
+    frames = np.zeros(energy.shape[1], dtype=bool)
+    for i0, i1, _f in spans:
+        if i1 > i0:
+            frames[max(0, i0):max(0, i1)] = True
+    if frames.sum() < 5:
+        return None
+    idx = np.flatnonzero(frames)
+    compact = []
+    pos = {f: k for k, f in enumerate(idx)}
+    for i0, i1, f in spans:
+        if i1 <= i0:
+            continue
+        keep = [pos[j] for j in range(max(0, i0), max(0, i1)) if j in pos]
+        if keep:
+            compact.append((min(keep), max(keep) + 1, f))
+    m = spans_mask(fgrid, len(idx), compact, 0.0, tol_cents)
+    e = energy[:, idx]
+    if m.all() or not m.any():
+        return None
+    return float(np.corrcoef(e.ravel().astype(np.float64),
+                             m.ravel().astype(np.float64))[0, 1])
+
+
 def chord_spans(chords, scale, offset, n_frames, trim_s=0.0, cents=0.0):
     """Score chords -> (i0, i1, freqs) on the audio frame grid, with `trim_s`
-    removed from each end and label frequencies shifted by `cents`."""
-    shift = 2.0 ** (cents / 1200.0)
+    removed from each end and label frequencies shifted by `cents`.
+
+    `cents` is one value PER CHORD (a scalar is accepted and applied to all).
+    Per chord because a choir drifts within a passage: one offset for the whole
+    take is the median of that drift, so it is wrong in opposite directions at
+    the two ends.
+    """
+    try:
+        per = [float(c) for c in cents]
+    except TypeError:
+        per = [float(cents)] * len(chords)
+    if len(per) != len(chords):
+        raise ValueError("cents has %d entries for %d chords"
+                         % (len(per), len(chords)))
     out = []
-    for t0, t1, freqs in chords:
+    for (t0, t1, freqs), c in zip(chords, per):
+        shift = 2.0 ** (c / 1200.0)
         i0 = int(np.ceil((scale * t0 + offset + trim_s) * SR / HOP))
         i1 = int(np.floor((scale * t1 + offset - trim_s) * SR / HOP))
         out.append((max(i0, 0), min(i1, n_frames), [f * shift for f in freqs]))

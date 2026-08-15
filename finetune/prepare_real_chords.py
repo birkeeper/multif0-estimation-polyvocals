@@ -81,17 +81,44 @@ import librosa.display
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import utils
-from tuning import align_and_tune, chord_spans, librosa_tuning_cents, SR, HOP
+from tuning import (align_and_tune, alignment_quality, chord_spans,
+                    estimate_tuning_cents, librosa_tuning_cents, SR, HOP)
 from compare_voice_salience import parse_midi, midi_tempo_bpm, track_name, hz, note_name
 
 
 # --------------------------------------------------------------------------
 # Score -> chords
 # --------------------------------------------------------------------------
+GM_DRUM_CHANNEL = 9        # MIDI channel 10, 1-based
+
+
+def broadband_db(wav_path, n_frames):
+    """Broadband level per frame, in dB, on the CQT hop grid.
+
+    Taken from the WAVEFORM, not by averaging CQT bins. A "20 dB drop" is only
+    meaningful on linear power, and the HCQT here is already log-scaled and
+    normalised per file, so averaging its bins would not yield a level at all.
+    """
+    import librosa
+    y, _sr = librosa.load(wav_path, sr=int(SR))
+    rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=int(HOP),
+                              center=True)[0]
+    db = 20.0 * np.log10(np.maximum(rms, 1e-10))
+    if len(db) < n_frames:
+        db = np.pad(db, (0, n_frames - len(db)), mode='edge')
+    return db[:n_frames]
+
+
 def read_blocked_chords(midi_path, m_from, m_to, bpm=None, beats_per_measure=4,
                         onset_tol=0.06, merge_repeats=False):
     """Chords as the interval in which ALL of the chord's notes sound TOGETHER:
     t0 = max(onset), t1 = min(offset).
+
+    Percussion channels are dropped. On channel 10 (index 9) the GM convention
+    is that the note number selects a drum, not a pitch, so a kick drum would
+    enter the chord as a low note and a hi-hat as a high one -- inventing voices
+    that were never sung, and dragging every chord's span to the intersection of
+    the real voices with the drum pattern.
 
     Deliberately NOT `compare_voice_salience.read_score()`, which runs each
     chord to the next chord's ONSET. That is fine for scoring salience against
@@ -112,16 +139,20 @@ def read_blocked_chords(midi_path, m_from, m_to, bpm=None, beats_per_measure=4,
     spb, tpm = 60.0 / bpm, div * beats_per_measure
     t_start, t_end = (m_from - 1) * tpm, m_to * tpm
 
-    notes = []
+    notes, skipped = [], []
     for ti, ev in enumerate(tracks):
-        if not any(k == 'midi' and (s & 0xF0) == 0x90 and d[1] > 0
+        pitched = [(_t, k, s, d) for _t, k, s, d in ev
+                   if k == 'midi' and (s & 0x0F) != GM_DRUM_CHANNEL]
+        if not any((s & 0xF0) == 0x90 and d[1] > 0 for _t, _k, s, d in pitched):
+            # No pitched notes. Report it only if the track had drum notes, so a
+            # dropped percussion part is visible rather than silently missing.
+            if any(k == 'midi' and (s & 0xF0) == 0x90 and d[1] > 0
                    for _t, k, s, d in ev):
-            continue                                  # conductor / empty track
+                skipped.append(track_name(ev, 'trk%d' % ti))
+            continue                                  # conductor / empty / drums
         name = track_name(ev, 'trk%d' % ti)
         pending = {}
-        for tick, kind, status, data in ev:
-            if kind != 'midi':
-                continue
+        for tick, kind, status, data in pitched:
             cmd = status & 0xF0
             if cmd == 0x90 and data[1] > 0:
                 pending.setdefault(data[0], []).append(tick)
@@ -132,6 +163,8 @@ def read_blocked_chords(midi_path, m_from, m_to, bpm=None, beats_per_measure=4,
                         notes.append((name, data[0],
                                       max(on, t_start) / div * spb,
                                       min(tick, t_end) / div * spb))
+    if skipped:
+        print("    percussion dropped: %s" % ', '.join(skipped))
     if not notes:
         return []
 
@@ -192,7 +225,7 @@ def _ylim_fundamentals(freqs, margin=1.12):
     return min(freqs) / margin, max(freqs) * margin
 
 
-def plot_take_overview(energy, chords, spans, fit, tune, cents, title, out_png,
+def plot_take_overview(energy, chords, spans, fit, cents, title, out_png,
                        n_harm=2, state=None):
     """Whole take: chord extent as fitted, the trimmed part actually used, and
     the corrected label frequencies drawn over the energy.
@@ -242,7 +275,7 @@ def plot_take_overview(energy, chords, spans, fit, tune, cents, title, out_png,
 
 
 def plot_tuning_evidence(energy, fgrid, chords, spans, tune, cents, title, out_png,
-                         span_cents=100.0, step=2.0):
+                         span_cents=100.0, step=2.0, per_cents=None):
     """The tuning estimate's own evidence, at a scale where it is visible.
 
     A 20-cent shift is about three pixels on a spectrogram spanning two
@@ -265,8 +298,10 @@ def plot_tuning_evidence(energy, fgrid, chords, spans, tune, cents, title, out_p
 
     if tune.get('grid') is not None:
         axc.plot(tune['grid'], tune['curve'], color='steelblue', lw=1.5)
+        # Whole-take curve, shown for context only: the offsets actually applied
+        # are per chord and appear on the right-hand panel.
         axc.axvline(tune['cents'], color='crimson', lw=1.5,
-                    label='estimate %+.1f c' % tune['cents'])
+                    label='whole-take %+.1f c (context)' % tune['cents'])
         axc.axhline(np.nanmedian(tune['curve']), color='grey', ls=':', lw=1,
                     label='median (prominence base)')
         axc.axvline(0.0, color='black', ls='--', lw=1, alpha=0.5, label='nominal A440')
@@ -293,7 +328,14 @@ def plot_tuning_evidence(energy, fgrid, chords, spans, tune, cents, title, out_p
         axe.plot(grid, mean, color='seagreen', lw=2.4, label='mean over voices')
         axe.axvline(grid[int(np.argmax(mean))], color='seagreen', ls='--', lw=1.2,
                     label='energy peak %+.0f c' % grid[int(np.argmax(mean))])
-    axe.axvline(cents, color='crimson', lw=1.5, label='applied %+.1f c' % cents)
+    if per_cents:
+        for k, c in enumerate(per_cents):
+            axe.axvline(c, color='crimson', lw=1.2, alpha=0.85,
+                        label='applied, per chord' if k == 0 else None)
+        axe.axvline(float(np.median(per_cents)), color='crimson', ls='--', lw=2.0,
+                    label='median %+.1f c' % float(np.median(per_cents)))
+    else:
+        axe.axvline(cents, color='crimson', lw=1.5, label='applied %+.1f c' % cents)
     axe.axvline(0.0, color='black', ls='--', lw=1, alpha=0.5, label='nominal A440')
     axe.set_xlabel('cents from nominal pitch')
     axe.set_ylabel('CQT energy (normalised dB)')
@@ -308,7 +350,8 @@ def plot_tuning_evidence(energy, fgrid, chords, spans, tune, cents, title, out_p
     plt.close(fig)
 
 
-def plot_chord_details(energy, chords, spans, fit, cents, title, out_png, n_harm=2):
+def plot_chord_details(energy, chords, spans, fit, cents, title, out_png, n_harm=2,
+                       per_cents=None):
     """One zoomed panel per chord. Corrected labels in green, uncorrected in
     red: if the green lines sit on ridges and the red ones do not, the tuning
     correction is doing its job. If neither does, the alignment is wrong."""
@@ -316,7 +359,6 @@ def plot_chord_details(energy, chords, spans, fit, cents, title, out_png, n_harm
     if n == 0:
         return
     fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 5.0), squeeze=False)
-    shift = 2.0 ** (cents / 1200.0)
     for ci, ax in enumerate(axes[0]):
         t0, t1, nominal = chords[ci]
         i0, i1, cfr = spans[ci]
@@ -326,7 +368,8 @@ def plot_chord_details(energy, chords, spans, fit, cents, title, out_png, n_harm
         ax.axvspan(s0, s1, color='lime', alpha=0.12)
         ax.axvline(a0, color='cyan', ls='--', lw=1.0)
         ax.axvline(a1, color='cyan', ls=':', lw=1.0)
-        if abs(cents) > 1e-6:
+        c_ci = per_cents[ci] if per_cents is not None else cents
+        if abs(c_ci) > 1e-6:
             ax.hlines(nominal, s0, s1, color='red', lw=1.2, ls=':', alpha=0.9)
         ax.hlines(cfr, s0, s1, color='lime', lw=1.6, alpha=0.95)
         pad = max(0.25, 0.35 * (a1 - a0))
@@ -550,25 +593,72 @@ def main(args):
                 print("    ! refit failed -- take skipped\n")
                 continue
 
-        fit, tune = res['fit'], res['tune']
-        cents = tune['cents'] if args.tuning_mode != 'none' else 0.0
+        fit = res['fit']
         print("    time  : scale=%.3f offset=%+.3f r=%.3f%s"
               % (fit['scale'], fit['offset'], fit['r'],
                  "  !SEARCH EDGE" if fit['at_edge'] else ""))
-        print("    tuning: %+.1f cents  prominence=%.3f%s"
-              % (tune['cents'], tune['prominence'],
-                 "  !SEARCH EDGE" if tune['at_edge'] else ""))
-        if args.librosa_check:
+
+        # ---- tuning, PER CHORD --------------------------------------------
+        #
+        # A choir drifts within a passage, so one offset for the take is the
+        # median of that drift and is wrong in opposite directions at its two
+        # ends. Each chord is measured on its own span instead.
+        #
+        # The alignment above needs no tuning correction: its mask is +-80
+        # cents wide, which already absorbs a choir 20-40 cents out.
+        #
+        # A chord whose correlation peak is flat has an UNKNOWN offset, which is
+        # not the same as zero, so it is dropped rather than labelled at the
+        # nominal pitch -- shifting a ridge onto the wrong bin is worse than
+        # having one less chord.
+        raw_spans = chord_spans(chords, fit['scale'], fit['offset'], T,
+                                trim_s=trim, cents=0.0)
+        per_cents, bad_tuning = [], []
+        for ci, sp in enumerate(raw_spans):
+            if args.tuning_mode == 'none' or sp[1] <= sp[0]:
+                per_cents.append(0.0)
+                continue
+            est = estimate_tuning_cents(res['energy'], fgrid, [sp],
+                                        search=(-args.tuning_search,
+                                                args.tuning_search, 1.0))
+            if est is None or est['prominence'] < args.min_tuning_prominence:
+                per_cents.append(0.0)
+                bad_tuning.append(ci)
+            else:
+                per_cents.append(est['cents'])
+        good = [c for ci, c in enumerate(per_cents) if ci not in bad_tuning]
+        if args.tuning_mode != 'none':
+            print("    tuning: per chord %s%s"
+                  % (' '.join('%+.0f' % c for c in per_cents),
+                     '   (drift %.0f c)' % (max(good) - min(good)) if len(good) > 1 else ''))
+            if bad_tuning:
+                print("      chord(s) %s: tuning peak too flat, offset unknown "
+                      "-- dropped" % ', '.join(str(c + 1) for c in bad_tuning))
+        if args.librosa_check and good:
             try:
                 lt = librosa_tuning_cents(wav)
-                print("    tuning cross-check (librosa): %+.1f c  diff %+.1f"
-                      % (lt, lt - tune['cents']))
+                print("    tuning cross-check (librosa): %+.1f c  vs per-chord "
+                      "median %+.1f" % (lt, float(np.median(good))))
             except Exception as e:
                 print("    tuning cross-check failed: %s" % e)
 
-        # ---- sustained spans, with the tuning correction on the LABELS ----
+        # ---- sustained spans, with each chord's own correction on the LABELS
         spans = chord_spans(chords, fit['scale'], fit['offset'], T,
-                            trim_s=trim, cents=cents)
+                            trim_s=trim, cents=per_cents)
+        for ci in bad_tuning:
+            spans[ci] = (spans[ci][0], spans[ci][0], spans[ci][2])   # unusable
+        cents = float(np.median(good)) if good else 0.0    # reporting only
+
+        # The fit's own r is computed over the whole image and is therefore
+        # penalised by COVERAGE, not just by misalignment: a score claiming
+        # 0.26 s out of every 1.6 s -- what a fixed MIDI gate time produces --
+        # leaves most of the energy at mask=0 however well it is aligned.
+        # Gate on the restricted measure, which asks only whether the energy is
+        # at the named pitches at the instants the score names them.
+        q = alignment_quality(res['energy'], fgrid, spans)
+        align_r = fit['r'] if q is None else q
+        print("    align : q=%s (fit r=%.3f over the whole file)"
+              % ('n/a' if q is None else '%.3f' % q, fit['r']))
 
         # ---- label the TIMELINE, then window the timeline --------------------
         #
@@ -601,25 +691,48 @@ def main(args):
                     pts_t.append(tgrid[i])
                     pts_f.append(f)
 
-        # Deep rest: between one chord's untrimmed release and the next chord's
-        # untrimmed attack, minus a margin for the reverb tail. Without these
-        # negatives every supervised frame would contain sounding voices and
-        # nothing in the loss would ever say "no voice here".
-        rest_margin = int(round(args.rest_margin_ms / 1000.0 * SR / HOP))
+        # Silence, decided from the audio, ONLY in the gap between a chord's
+        # note-off and the next chord's note-on.
+        #
+        # A fixed reverb margin was a guess; the recording can be asked instead.
+        # Broadband level rather than energy at the chord's pitches, because
+        # "silence" asserts that NOTHING is sounding, and only a broadband
+        # measure can rule out what the score did not predict -- an early entry,
+        # a breath, a stray voice. From the waveform, since a 20 dB drop is only
+        # meaningful on linear power and the HCQT is already log-scaled and
+        # per-file normalised.
+        #
+        # The chord label itself is never extended past the score's note-off:
+        # past that point a held note and a reverb tail are indistinguishable,
+        # so the frames stay masked unless the level says they are silent.
         n_rest = 0
         if not args.no_rest_negatives:
-            bounds = []
-            for (t0, t1, _f) in chords:
-                bounds.append((int(np.floor((fit['scale'] * t0 + fit['offset']) * SR / HOP)),
-                               int(np.ceil((fit['scale'] * t1 + fit['offset']) * SR / HOP))))
-            for k in range(len(bounds) + 1):
-                lo = 0 if k == 0 else bounds[k - 1][1] + rest_margin
-                hi = T if k == len(bounds) else bounds[k][0] - rest_margin
-                lo, hi = max(lo, 0), min(hi, T)
-                if hi - lo >= args.min_rest_frames:
-                    mask[lo:hi] = 1.0
-                    state[lo:hi] = 2
-                    n_rest += hi - lo
+            bb = broadband_db(wav, T)
+            for ci, (t0, t1, _f) in enumerate(chords):
+                i0, i1 = spans[ci][0], spans[ci][1]
+                if i1 <= i0:
+                    continue
+                sustain = float(np.median(bb[i0:i1]))
+                gap0 = int(np.ceil((fit['scale'] * t1 + fit['offset']) * SR / HOP))
+                gap1 = (int(np.floor((fit['scale'] * chords[ci + 1][0]
+                                      + fit['offset']) * SR / HOP))
+                        if ci + 1 < len(chords) else T)
+                gap0, gap1 = max(gap0, 0), min(gap1, T)
+                if gap1 - gap0 < args.min_rest_frames:
+                    continue
+                quiet = bb[gap0:gap1] < sustain - args.silence_db
+                # only runs long enough to be a rest rather than a dip
+                run = 0
+                for k in range(len(quiet) + 1):
+                    if k < len(quiet) and quiet[k]:
+                        run += 1
+                        continue
+                    if run >= args.min_rest_frames:
+                        lo = gap0 + k - run
+                        state[lo:gap0 + k] = 2
+                        mask[lo:gap0 + k] = 1.0
+                        n_rest += run
+                    run = 0
 
         target = utils.create_annotation_target(
             fgrid, tgrid, np.array(pts_t), np.array(pts_f)).astype(np.float32) \
@@ -636,29 +749,28 @@ def main(args):
         # that was rejected is exactly the one worth looking at, and a picture
         # only of the takes that passed cannot show why the others were not.
         reason = ''
-        if fit['r'] < args.min_align_r:
-            reason = 'REJECTED: align r %.3f < %.2f' % (fit['r'], args.min_align_r)
-        elif (args.tuning_mode != 'none'
-              and tune['prominence'] < args.min_tuning_prominence):
-            reason = ('REJECTED: tuning prominence %.3f < %.2f'
-                      % (tune['prominence'], args.min_tuning_prominence))
+        if align_r < args.min_align_r:
+            reason = 'REJECTED: align q %.3f < %.2f' % (align_r, args.min_align_r)
         elif n_chord == 0:
             reason = 'REJECTED: no supervised chord frames'
 
         if not args.no_plots:
-            title = ("%s [%s]  scale=%.3f offset=%+.3f r=%.3f | tuning %+.1f c "
-                     "(prom %.3f) | trim %.0f ms  %s"
+            title = ("%s [%s]  scale=%.3f offset=%+.3f q=%.3f | tuning median "
+                     "%+.1f c (%d chord(s) dropped) | trim %.0f ms  %s"
                      % (take, split if not reason else 'skipped', fit['scale'],
-                        fit['offset'], fit['r'], tune['cents'], tune['prominence'],
+                        fit['offset'], align_r, cents, len(bad_tuning),
                         args.trim_ms, reason))
-            plot_take_overview(res['energy'], chords, spans, fit, tune, cents,
+            plot_take_overview(res['energy'], chords, spans, fit, cents,
                                title, os.path.join(plot_dir, '%s_overview.png' % take),
                                args.plot_harmonics, state=state)
             plot_chord_details(res['energy'], chords, spans, fit, cents, title,
                                os.path.join(plot_dir, '%s_chords.png' % take),
-                               args.plot_harmonics)
-            plot_tuning_evidence(res['energy'], fgrid, chords, spans, tune, cents,
-                                 title, os.path.join(plot_dir, '%s_tuning.png' % take))
+                               args.plot_harmonics, per_cents=per_cents)
+            plot_tuning_evidence(res['energy'], fgrid, chords, spans,
+                                 res['tune'], cents, title,
+                                 os.path.join(plot_dir, '%s_tuning.png' % take),
+                                 per_cents=[c for ci, c in enumerate(per_cents)
+                                            if ci not in bad_tuning])
             print("    plots : %s_{overview,chords,tuning}.png" % take)
 
         if reason:
@@ -694,9 +806,11 @@ def main(args):
             chords_total=len(chords), chords_covered=len(kept_chords),
             sup_chord=n_chord, sup_silence=n_rest,
             masked=T - int(mask.sum()),
-            cents=round(cents, 1), tuning_prominence=round(tune['prominence'], 3),
+            cents=round(cents, 1),
+            cents_per_chord=' '.join('%+.0f' % c for c in per_cents),
+            chords_no_tuning=len(bad_tuning),
             scale=fit['scale'], offset=round(fit['offset'], 3),
-            align_r=round(fit['r'], 3)))
+            align_q=round(align_r, 3), align_r=round(fit['r'], 3)))
         print("    %d windows (>= %d supervised frames each), covering %d/%d chords\n"
               % (fw, min_sup, len(kept_chords), len(chords)))
 
@@ -808,11 +922,15 @@ if __name__ == '__main__':
                         'may straddle chord boundaries -- that is the point, it '
                         'is what the model sees at inference -- so this only '
                         'discards windows that are almost entirely mask.')
-    p.add_argument('--rest_margin_ms', type=float, default=300.0,
-                   help='how long after a chord releases before silence is '
-                        'trusted as silence (default 250). Covers the reverb '
-                        'tail: labelling a ringing chord as silent would teach '
-                        'the model to suppress it.')
+    p.add_argument('--silence_db', type=float, default=30.0,
+                   help="a frame in the gap between a chord's note-off and the "
+                        "next note-on counts as silence only when the BROADBAND "
+                        "level has fallen at least this far below that chord's "
+                        "own sustained level (default 30). This replaces a fixed "
+                        "reverb margin: the recording is measured instead of the "
+                        "room being guessed at. The chord label is never extended "
+                        "past the score's note-off -- frames in the gap are "
+                        "either silent by this test or masked.")
     p.add_argument('--min_rest_frames', type=int, default=6,
                    help='ignore rests shorter than this many frames once the '
                         'reverb margin is removed (default 6)')
@@ -823,16 +941,24 @@ if __name__ == '__main__':
                         'same missing counterweight that let --pos_weight 4 '
                         'inflate salience by 55%%.')
 
-    p.add_argument('--tuning_mode', choices=['per_take', 'none'], default='per_take',
-                   help="'per_take' (default) measures the choir's offset and "
-                        "shifts the LABEL frequencies onto it. 'none' trusts A440 "
-                        "-- only safe if you have vr=%erified the choir is within "
-                        "~10 cents, since sigma is 20 cents.")
+    p.add_argument('--tuning_mode', choices=['per_chord', 'none'], default='per_chord',
+                   help="'per_chord' (default) measures the choir's offset "
+                        "separately for each chord and shifts that chord's LABEL "
+                        "frequencies onto it, so drift within a take is followed. "
+                        "'none' trusts A440 -- only safe if the choir is verified "
+                        "within ~10 cents, since sigma is 20 cents.")
+    p.add_argument('--tuning_search', type=float, default=100.0,
+                   help='cents searched either side of nominal when measuring a '
+                        "chord's tuning (default 100). Wider costs time and lets "
+                        'the peak land on a neighbouring semitone; narrower can '
+                        'miss a badly flat choir.')
     p.add_argument('--min_tuning_prominence', type=float, default=0.05,
-                   help='skip a take whose tuning correlation peak is flatter than '
-                        'this. A flat curve means the offset is UNKNOWN, which is '
-                        'not the same as zero (default 0.05; a real recording '
-                        'measured 0.10, synthetic renders 0.22)')
+                   help="drop a CHORD whose tuning correlation peak is flatter "
+                        'than this. A flat curve means the offset is UNKNOWN, '
+                        'which is not the same as zero, and labelling it at the '
+                        'nominal pitch could put the ridge on the wrong bin '
+                        '(default 0.05; a real recording measured 0.10, synthetic '
+                        'renders 0.22)')
     p.add_argument('--librosa_check', action='store_true',
                    help='also report librosa.estimate_tuning, an independent '
                         'score-free estimate with different failure modes')
