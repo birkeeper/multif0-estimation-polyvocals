@@ -68,6 +68,7 @@ import os
 import sys
 import csv
 import glob
+import fnmatch
 import argparse
 
 import numpy as np
@@ -360,13 +361,73 @@ def pair_audio_with_midi(audio_paths, midi_paths):
     return pairs, unmatched
 
 
+AUDIO_EXT = ('.wav', '.flac', '.ogg')
+
+
+def expand_midi(patterns):
+    """Globs, plus directories (which contribute every .mid inside them)."""
+    out = []
+    for pat in patterns:
+        pat = os.path.expanduser(pat)
+        for hit in (sorted(glob.glob(pat)) or []):
+            if os.path.isdir(hit):
+                out.extend(sorted(glob.glob(os.path.join(hit, '*.mid'))))
+            else:
+                out.append(hit)
+    return sorted(set(out))
+
+
+def discover_takes(midis, audio_dir=None, exclude=()):
+    """Every audio file whose name begins with some score's name.
+
+    Takes of one song are conventionally `<song>_takeNN.wav` beside `<song>.mid`,
+    which is the same prefix rule `pair_audio_with_midi()` uses to decide which
+    score a take belongs to -- so discovery and pairing cannot disagree. Matching
+    is case-insensitive because `Parijs.mid` and `parijs_take01.wav` are the same
+    song, and the directory is listed rather than globbed because glob is
+    case-sensitive on Linux.
+    """
+    stems = [os.path.splitext(os.path.basename(m))[0].lower() for m in midis]
+    dirs = ([os.path.expanduser(audio_dir)] if audio_dir
+            else sorted({os.path.dirname(m) or '.' for m in midis}))
+    found = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            base, ext = os.path.splitext(f)
+            if ext.lower() not in AUDIO_EXT:
+                continue
+            if not any(base.lower().startswith(s) for s in stems):
+                continue
+            if any(fnmatch.fnmatch(f.lower(), pat.lower()) for pat in exclude):
+                print("  - excluded %s" % f)
+                continue
+            found.append(os.path.join(d, f))
+    return found
+
+
 def main(args):
-    audio = sorted(sum([glob.glob(os.path.expanduser(p)) for p in args.audio], []))
-    midis = sorted(sum([glob.glob(os.path.expanduser(p)) for p in args.midi], []))
-    if not audio:
-        raise SystemExit("--audio matched no files")
+    midis = expand_midi(args.midi)
     if not midis:
         raise SystemExit("--midi matched no files")
+
+    if args.audio:
+        audio = sorted(sum([glob.glob(os.path.expanduser(p)) for p in args.audio], []))
+        if not audio:
+            raise SystemExit("--audio matched no files")
+    else:
+        audio = discover_takes(midis, args.audio_dir, args.exclude or ())
+        if not audio:
+            raise SystemExit(
+                "No takes found next to %s. Takes are discovered by name: a file "
+                "is a take of <song>.mid when it starts with '<song>' and ends in "
+                "%s. Either rename them, or list them explicitly with --audio."
+                % (', '.join(os.path.basename(m) for m in midis),
+                   '/'.join(AUDIO_EXT)))
+        print("discovered %d take(s) for %d score(s):" % (len(audio), len(midis)))
+        for a in audio:
+            print("    %s" % os.path.basename(a))
 
     pairs, unmatched = pair_audio_with_midi(audio, midis)
     for a in unmatched:
@@ -700,11 +761,22 @@ def main(args):
 if __name__ == '__main__':
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--audio', nargs='+', required=True,
-                   help="wav takes, globs allowed (e.g. 'rec/*.wav')")
+    p.add_argument('--audio', nargs='+', default=None,
+                   help="takes to use, globs allowed. OPTIONAL: if omitted, every "
+                        "audio file whose name starts with a score's name is "
+                        "discovered automatically, so '<song>_take01.wav' .. "
+                        "'<song>_take20.wav' beside '<song>.mid' need not be listed.")
+    p.add_argument('--audio_dir', default=None,
+                   help='where to look for takes during discovery (default: the '
+                        'directory each score sits in)')
+    p.add_argument('--exclude', nargs='+', default=None, metavar='PATTERN',
+                   help="drop discovered files matching these glob patterns, e.g. "
+                        "'*synthetisch*' to keep a soundfont render out of a set "
+                        "meant to be real recordings. Case-insensitive.")
     p.add_argument('--midi', nargs='+', required=True,
-                   help="scores, globs allowed. A take pairs with the score whose "
-                        "stem is the longest prefix of the take's stem")
+                   help="scores: files, globs, or a DIRECTORY (every .mid inside "
+                        "it). A take pairs with the score whose stem is the "
+                        "longest prefix of the take's stem")
     p.add_argument('--out', required=True, help='output directory')
     p.add_argument('--measures', default='1-2',
                    help='measure range of blocked chords to use (default 1-2)')
@@ -736,7 +808,7 @@ if __name__ == '__main__':
                         'may straddle chord boundaries -- that is the point, it '
                         'is what the model sees at inference -- so this only '
                         'discards windows that are almost entirely mask.')
-    p.add_argument('--rest_margin_ms', type=float, default=250.0,
+    p.add_argument('--rest_margin_ms', type=float, default=300.0,
                    help='how long after a chord releases before silence is '
                         'trusted as silence (default 250). Covers the reverb '
                         'tail: labelling a ringing chord as silent would teach '
